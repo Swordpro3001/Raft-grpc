@@ -285,6 +285,7 @@ public class RaftNode {
                         matchIndex.put(peerId, newMatchIndex);
                         nextIndex.put(peerId, newMatchIndex + 1);
                         updateCommitIndex();
+                        applyCommittedEntries();
                     }
                 } else {
                     nextIndex.put(peerId, Math.max(0, peerNextIndex - 1));
@@ -304,11 +305,13 @@ public class RaftNode {
         if (majorityIndex < indices.size()) {
             int newCommitIndex = indices.get(majorityIndex);
             
-            if (newCommitIndex > commitIndex.get() && 
+            // Allow commitIndex to be set to 0 for first entry
+            if (newCommitIndex >= commitIndex.get() && 
                 newCommitIndex < raftLog.size() && 
                 raftLog.get(newCommitIndex).getTerm() == currentTerm.get()) {
                 commitIndex.set(newCommitIndex);
                 log.debug("Updated commit index to {}", newCommitIndex);
+                applyCommittedEntries();
             }
         }
     }
