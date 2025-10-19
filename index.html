@@ -1,0 +1,801 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Raft Cluster Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        h1 {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+            font-size: 2.5em;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .command-section {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 30px;
+        }
+        
+        .command-section h2 {
+            color: #667eea;
+            margin-bottom: 15px;
+        }
+        
+        .input-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        
+        input[type="text"] {
+            flex: 1;
+            padding: 12px 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+        
+        input[type="text"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        button {
+            padding: 12px 25px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+        
+        button:hover {
+            background: #5568d3;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        button:active {
+            transform: translateY(0);
+        }
+        
+        .message {
+            padding: 12px;
+            border-radius: 8px;
+            margin-top: 10px;
+            display: none;
+        }
+        
+        .message.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .message.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .nodes-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 20px;
+        }
+        
+        .node-card {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            transition: transform 0.3s;
+        }
+        
+        .node-card:hover {
+            transform: translateY(-5px);
+        }
+        
+        .node-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #f0f0f0;
+        }
+        
+        .node-controls {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 15px;
+        }
+        
+        .node-controls button {
+            padding: 8px 16px;
+            font-size: 14px;
+            border-radius: 6px;
+        }
+        
+        .btn-start {
+            background: #28a745;
+        }
+        
+        .btn-start:hover {
+            background: #218838;
+        }
+        
+        .btn-stop {
+            background: #dc3545;
+        }
+        
+        .btn-stop:hover {
+            background: #c82333;
+        }
+        
+        .btn-start:disabled, .btn-stop:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .node-card.offline {
+            opacity: 0.6;
+            background: #f8f9fa;
+        }
+        
+        .node-title {
+            font-size: 1.5em;
+            font-weight: bold;
+            color: #333;
+        }
+        
+        .node-state {
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 0.9em;
+            text-transform: uppercase;
+        }
+        
+        .state-LEADER {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        .state-FOLLOWER {
+            background: #cce5ff;
+            color: #004085;
+        }
+        
+        .state-CANDIDATE {
+            background: #fff3cd;
+            color: #856404;
+        }
+        
+        .node-info {
+            margin-bottom: 15px;
+        }
+        
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        
+        .info-label {
+            font-weight: 600;
+            color: #666;
+        }
+        
+        .info-value {
+            color: #333;
+            font-weight: 500;
+        }
+        
+        .state-machine {
+            margin-top: 20px;
+        }
+        
+        .state-machine h3 {
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 1.1em;
+        }
+        
+        .state-machine-list {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 15px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        
+        .state-machine-item {
+            padding: 8px;
+            background: white;
+            margin-bottom: 5px;
+            border-radius: 5px;
+            border-left: 3px solid #667eea;
+            font-family: 'Courier New', monospace;
+        }
+        
+        .state-machine-empty {
+            color: #999;
+            text-align: center;
+            padding: 20px;
+        }
+        
+        .node-event-log {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            border-radius: 8px;
+            padding: 10px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 11px;
+            line-height: 1.5;
+        }
+        
+        .event-item-compact {
+            padding: 5px 8px;
+            margin-bottom: 3px;
+            border-radius: 3px;
+            border-left: 2px solid #667eea;
+            background: #2d2d2d;
+        }
+        
+        .event-timestamp-compact {
+            color: #858585;
+            margin-right: 8px;
+            font-size: 10px;
+        }
+        
+        .event-description-compact {
+            color: #d4d4d4;
+            margin-top: 2px;
+            font-size: 11px;
+            padding-left: 4px;
+        }
+        
+        .event-log {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            border-radius: 8px;
+            padding: 15px;
+            max-height: 400px;
+            overflow-y: auto;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+        
+        .event-item {
+            padding: 6px 10px;
+            margin-bottom: 4px;
+            border-radius: 4px;
+            border-left: 3px solid #667eea;
+            background: #2d2d2d;
+            transition: background 0.3s;
+        }
+        
+        .event-item:hover {
+            background: #3d3d3d;
+        }
+        
+        .event-item.new {
+            animation: highlightNew 1s;
+        }
+        
+        @keyframes highlightNew {
+            0% { background: #667eea; }
+            100% { background: #2d2d2d; }
+        }
+        
+        .event-timestamp {
+            color: #858585;
+            margin-right: 10px;
+        }
+        
+        .event-node {
+            color: #4ec9b0;
+            margin-right: 10px;
+            font-weight: bold;
+        }
+        
+        .event-type {
+            padding: 2px 8px;
+            border-radius: 4px;
+            margin-right: 10px;
+            font-size: 11px;
+            font-weight: bold;
+        }
+        
+        .event-type-STATE_CHANGE {
+            background: #569cd6;
+            color: white;
+        }
+        
+        .event-type-ELECTION_START {
+            background: #dcdcaa;
+            color: #1e1e1e;
+        }
+        
+        .event-type-VOTE_GRANTED {
+            background: #4ec9b0;
+            color: #1e1e1e;
+        }
+        
+        .event-type-VOTE_DENIED {
+            background: #f48771;
+            color: white;
+        }
+        
+        .event-type-ELECTION_WON {
+            background: #6a9955;
+            color: white;
+        }
+        
+        .event-type-ELECTION_LOST {
+            background: #d16969;
+            color: white;
+        }
+        
+        .event-type-HEARTBEAT_RECEIVED {
+            background: #b267e6;
+            color: white;
+        }
+        
+        .event-type-TERM_INCREASED {
+            background: #ce9178;
+            color: #1e1e1e;
+        }
+        
+        .event-type-LOG_REPLICATED {
+            background: #4fc1ff;
+            color: #1e1e1e;
+        }
+        
+        .event-type-COMMAND_RECEIVED {
+            background: #9cdcfe;
+            color: #1e1e1e;
+        }
+        
+        .event-description {
+            color: #d4d4d4;
+        }
+        
+        .event-log-empty {
+            color: #858585;
+            text-align: center;
+            padding: 40px;
+            font-style: italic;
+        }
+        
+        .refresh-status {
+            text-align: center;
+            color: white;
+            margin-top: 10px;
+            font-size: 0.9em;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        .updating {
+            animation: pulse 1s infinite;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Raft Cluster Dashboard</h1>
+        
+        <div class="command-section">
+            <h2>Command eingeben</h2>
+            <div class="input-group">
+                <input type="text" id="commandInput" placeholder="z.B. SET key=value oder ADD item">
+                <button onclick="submitCommand()">Command senden</button>
+                <button onclick="refreshStatus()">Status aktualisieren</button>
+            </div>
+            <div id="commandMessage" class="message"></div>
+        </div>
+        
+        <h2 style="color: white; margin-bottom: 15px; text-align: center;">📊 Cluster Nodes</h2>
+        
+        <div id="nodesContainer" class="nodes-grid"></div>
+        
+        <div class="refresh-status">
+            Auto-Refresh alle 2 Sekunden
+        </div>
+    </div>
+    
+    <script>
+        const nodes = [
+            { id: 'node1', port: 8081 },
+            { id: 'node2', port: 8082 },
+            { id: 'node3', port: 8083 },
+            { id: 'node4', port: 8084 },
+            { id: 'node5', port: 8085 }
+        ];
+        
+        // Cache for previous state to detect changes
+        let previousStates = {};
+        let refreshInterval = null;
+        let isPageVisible = true;
+        
+        // Detect if page is visible (don't poll when hidden)
+        document.addEventListener('visibilitychange', () => {
+            isPageVisible = !document.hidden;
+            if (isPageVisible) {
+                refreshStatus(); // Immediate refresh when page becomes visible
+            }
+        });
+        
+        // Try to find any available node for management operations
+        async function findAvailableManagerNode() {
+            for (const node of nodes) {
+                try {
+                    const response = await fetch(`http://localhost:${node.port}/api/status`, {
+                        method: 'GET',
+                        signal: AbortSignal.timeout(2000) // 2 second timeout
+                    });
+                    if (response.ok) {
+                        console.log(`Using ${node.id} (port ${node.port}) for management`);
+                        return node.port;
+                    }
+                } catch (error) {
+                    // Node not available, try next
+                }
+            }
+            return null; // No node available
+        }
+        
+        function formatTimestamp(timestamp) {
+            const date = new Date(timestamp);
+            return date.toLocaleTimeString('de-DE', { 
+                hour: '2-digit', 
+                minute: '2-digit', 
+                second: '2-digit'
+            });
+        }
+        
+        async function submitCommand() {
+            const input = document.getElementById('commandInput');
+            const message = document.getElementById('commandMessage');
+            const command = input.value.trim();
+            
+            if (!command) {
+                showMessage('Bitte einen Command eingeben', 'error');
+                return;
+            }
+            
+            let success = false;
+            let responseMsg = '';
+            
+            for (const node of nodes) {
+                try {
+                    const response = await fetch(`http://localhost:${node.port}/api/command`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ command })
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        success = true;
+                        responseMsg = `✓ Command erfolgreich an ${node.id} (Leader) gesendet`;
+                        break;
+                    } else {
+                        responseMsg = data.message || 'Command fehlgeschlagen';
+                    }
+                } catch (error) {
+                    console.log(`Node ${node.id} nicht erreichbar`);
+                }
+            }
+            
+            if (success) {
+                showMessage(responseMsg, 'success');
+                input.value = '';
+                setTimeout(refreshStatus, 500);
+            } else {
+                showMessage(responseMsg || 'Kein Leader gefunden. Warte auf Leader-Election...', 'error');
+            }
+        }
+        
+        function showMessage(text, type) {
+            const message = document.getElementById('commandMessage');
+            message.textContent = text;
+            message.className = `message ${type}`;
+            message.style.display = 'block';
+            
+            setTimeout(() => {
+                message.style.display = 'none';
+            }, 5000);
+        }
+        
+        async function fetchNodeStatus(node) {
+            try {
+                const response = await fetch(`http://localhost:${node.port}/api/status`);
+                const status = await response.json();
+                
+                // Fetch events for this node
+                try {
+                    const eventsResponse = await fetch(`http://localhost:${node.port}/api/events`);
+                    if (eventsResponse.ok) {
+                        status.events = await eventsResponse.json();
+                    } else {
+                        status.events = [];
+                    }
+                } catch (e) {
+                    status.events = [];
+                }
+                
+                return status;
+            } catch (error) {
+                return {
+                    nodeId: node.id,
+                    state: 'OFFLINE',
+                    currentTerm: 0,
+                    currentLeader: null,
+                    commitIndex: 0,
+                    logSize: 0,
+                    stateMachine: [],
+                    events: [],
+                    error: true
+                };
+            }
+        }
+        
+        async function startNode(nodeId) {
+            const managerPort = await findAvailableManagerNode();
+            
+            if (!managerPort) {
+                showMessage(`✗ Kein Node verfügbar für Management-Operationen`, 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`http://localhost:${managerPort}/api/nodes/${nodeId}/start`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                if (data.success) {
+                    showMessage(`✓ ${nodeId} wird gestartet...`, 'success');
+                    setTimeout(refreshStatus, 3000);
+                } else {
+                    showMessage(`✗ ${data.message}`, 'error');
+                }
+            } catch (error) {
+                showMessage(`✗ Fehler beim Starten von ${nodeId}: ${error.message}`, 'error');
+            }
+        }
+        
+        async function stopNode(nodeId) {
+            const managerPort = await findAvailableManagerNode();
+            
+            if (!managerPort) {
+                showMessage(`✗ Kein Node verfügbar für Management-Operationen`, 'error');
+                return;
+            }
+            
+            // Warnung wenn der Node, der gestoppt werden soll, der letzte laufende Node ist
+            const runningNodes = nodes.filter(n => n.port !== parseInt(nodeId.replace('node', '')) + 8080);
+            if (runningNodes.length === 0) {
+                const confirmed = confirm(
+                    '⚠️ WARNUNG: Dies ist der letzte laufende Node!\n\n' +
+                    'Wenn Sie diesen Node stoppen:\n' +
+                    '• Dieses Dashboard funktioniert nicht mehr\n' +
+                    '• Start/Stop-APIs sind nicht erreichbar\n' +
+                    '• Sie müssen Nodes manuell neu starten\n\n' +
+                    'Möchten Sie fortfahren?'
+                );
+                
+                if (!confirmed) {
+                    return;
+                }
+            }
+            
+            try {
+                const response = await fetch(`http://localhost:${managerPort}/api/nodes/${nodeId}/stop`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                if (data.success) {
+                    showMessage(`✓ ${nodeId} wurde gestoppt`, 'success');
+                    setTimeout(refreshStatus, 1000);
+                } else {
+                    showMessage(`✗ ${data.message}`, 'error');
+                }
+            } catch (error) {
+                showMessage(`✗ Fehler beim Stoppen von ${nodeId}: ${error.message}`, 'error');
+            }
+        }
+        
+        function hasStateChanged(nodeId, newStatus) {
+            const prev = previousStates[nodeId];
+            if (!prev) return true; // First time
+            
+            // Check if any relevant field changed
+            return prev.state !== newStatus.state ||
+                   prev.currentTerm !== newStatus.currentTerm ||
+                   prev.currentLeader !== newStatus.currentLeader ||
+                   prev.commitIndex !== newStatus.commitIndex ||
+                   prev.logSize !== newStatus.logSize ||
+                   prev.stateMachine.length !== newStatus.stateMachine.length ||
+                   prev.events.length !== newStatus.events.length ||
+                   prev.error !== newStatus.error;
+        }
+        
+        function updateNodeCard(nodeId, status) {
+            const cardId = `node-card-${nodeId}`;
+            let card = document.getElementById(cardId);
+            
+            // Create card if it doesn't exist
+            if (!card) {
+                const container = document.getElementById('nodesContainer');
+                const div = document.createElement('div');
+                div.id = cardId;
+                container.appendChild(div);
+                card = div;
+            }
+            
+            // Only update if state changed
+            if (hasStateChanged(nodeId, status)) {
+                card.innerHTML = renderNodeContent(status);
+                previousStates[nodeId] = JSON.parse(JSON.stringify(status)); // Deep copy
+            }
+        }
+        
+        function renderNodeContent(status) {
+            const isOffline = status.error || status.state === 'OFFLINE';
+            const nodeRunning = !isOffline;
+            const events = status.events || [];
+            
+            // Sort events by timestamp (newest first)
+            const sortedEvents = [...events].sort((a, b) => 
+                new Date(b.timestamp) - new Date(a.timestamp)
+            ).slice(0, 10); // Show only last 10 events
+            
+            return `
+                <div class="node-card ${isOffline ? 'offline' : ''}">
+                    <div class="node-header">
+                        <div class="node-title">${status.nodeId}</div>
+                        <div class="node-state state-${status.state}">${status.state}</div>
+                    </div>
+                    
+                    <div class="node-controls">
+                        <button class="btn-start" onclick="startNode('${status.nodeId}')" ${nodeRunning ? 'disabled' : ''}>
+                            ▶ Start
+                        </button>
+                        <button class="btn-stop" onclick="stopNode('${status.nodeId}')" ${!nodeRunning ? 'disabled' : ''}>
+                            ⏹ Stop
+                        </button>
+                    </div>
+                    
+                    <div class="node-info">
+                        <div class="info-row">
+                            <span class="info-label">Term:</span>
+                            <span class="info-value">${status.currentTerm}</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">Leader:</span>
+                            <span class="info-value">${status.currentLeader || 'Unbekannt'}</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">Commit Index:</span>
+                            <span class="info-value">${status.commitIndex}</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">Log Size:</span>
+                            <span class="info-value">${status.logSize}</span>
+                        </div>
+                    </div>
+                    
+                    <div class="state-machine">
+                        <h3>📋 Event Log (${events.length} gesamt, zeige letzte 10)</h3>
+                        <div class="node-event-log">
+                            ${sortedEvents.length === 0 
+                                ? '<div class="event-log-empty">Keine Events</div>'
+                                : sortedEvents.map(event => `
+                                    <div class="event-item-compact">
+                                        <span class="event-timestamp-compact">${formatTimestamp(event.timestamp)}</span>
+                                        <span class="event-type event-type-${event.type}">
+                                            ${event.type.replace(/_/g, ' ')}
+                                        </span>
+                                        <div class="event-description-compact">${event.description}</div>
+                                    </div>
+                                `).join('')
+                            }
+                        </div>
+                    </div>
+                    
+                    <div class="state-machine">
+                        <h3>State Machine (${status.stateMachine.length} Einträge)</h3>
+                        <div class="state-machine-list">
+                            ${status.stateMachine.length === 0 
+                                ? '<div class="state-machine-empty">Keine Commands ausgeführt</div>'
+                                : status.stateMachine.map((cmd, i) => 
+                                    `<div class="state-machine-item">${i + 1}. ${cmd}</div>`
+                                ).join('')
+                            }
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+        
+        async function refreshStatus() {
+            if (!isPageVisible) {
+                return; // Don't poll when page is hidden
+            }
+            
+            const statuses = await Promise.all(
+                nodes.map(node => fetchNodeStatus(node))
+            );
+            
+            // Update each node card individually (only if changed)
+            statuses.forEach(status => {
+                updateNodeCard(status.nodeId, status);
+            });
+        }
+        
+        // Enter-Taste für Command-Submit
+        document.getElementById('commandInput').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                submitCommand();
+            }
+        });
+        
+        // Make functions global
+        window.startNode = startNode;
+        window.stopNode = stopNode;
+        window.submitCommand = submitCommand;
+        window.refreshStatus = refreshStatus;
+        
+        // Initial load
+        refreshStatus();
+        
+        // Smart polling: only when page is visible
+        refreshInterval = setInterval(() => {
+            if (isPageVisible) {
+                refreshStatus();
+            }
+        }, 2000);
+    </script>
+</body>
+</html>
