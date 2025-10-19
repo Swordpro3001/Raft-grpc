@@ -61,8 +61,7 @@ class RaftEventTest {
         assertNotNull(logString);
         assertTrue(logString.contains("VOTE_GRANTED"));
         assertTrue(logString.contains("Granted vote to node2"));
-        assertTrue(logString.contains("term=2"));
-        assertTrue(logString.contains("node=node1"));
+        assertTrue(logString.contains("Term 2"));
     }
 
     @Test

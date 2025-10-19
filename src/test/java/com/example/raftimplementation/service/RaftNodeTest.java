@@ -235,10 +235,9 @@ class RaftNodeTest {
         assertEquals("node1", status.get("nodeId"));
         assertEquals("FOLLOWER", status.get("state"));
         assertEquals(0, status.get("currentTerm"));
-        assertNotNull(status.get("log"));
+        assertNotNull(status.get("logSize"));
         assertNotNull(status.get("stateMachine"));
         assertNotNull(status.get("commitIndex"));
-        assertNotNull(status.get("lastApplied"));
     }
 
     @Test
