@@ -1,0 +1,81 @@
+name: Code Quality
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  code-quality:
+    name: Code Quality Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history for better analysis
+        
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: 'gradle'
+        
+    - name: Grant execute permission for gradlew
+      run: chmod +x gradlew
+      
+    - name: Run Checkstyle
+      run: ./gradlew checkstyleMain checkstyleTest --no-daemon || true
+      continue-on-error: true
+      
+    - name: Run SpotBugs
+      run: ./gradlew spotbugsMain --no-daemon || true
+      continue-on-error: true
+      
+    - name: Run PMD
+      run: ./gradlew pmdMain --no-daemon || true
+      continue-on-error: true
+      
+    - name: Upload code quality reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: code-quality-reports
+        path: |
+          build/reports/checkstyle/
+          build/reports/spotbugs/
+          build/reports/pmd/
+        retention-days: 30
+        
+  dependency-check:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: 'gradle'
+        
+    - name: Grant execute permission for gradlew
+      run: chmod +x gradlew
+      
+    - name: Check for dependency vulnerabilities
+      run: ./gradlew dependencyCheckAnalyze --no-daemon || true
+      continue-on-error: true
+      
+    - name: Upload dependency check report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: dependency-check-report
+        path: build/reports/dependency-check-report.html
+        retention-days: 30
