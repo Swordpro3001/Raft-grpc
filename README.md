@@ -286,3 +286,8 @@ MIT License
 ## Author
 
 Built with Spring Boot 3.5.6, gRPC, and the Raft Consensus Algorithm
+
+
+[Schnellstart](SCHNELLSTART.md)
+
+[Troubleshooting](TROUBLESHOOTING.md)
