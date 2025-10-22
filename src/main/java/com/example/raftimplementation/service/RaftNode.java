@@ -31,8 +31,8 @@ public class RaftNode {
     private volatile String votedFor = null;
     private volatile String currentLeader = null;
     private final List<com.example.raftimplementation.model.LogEntry> raftLog = Collections.synchronizedList(new ArrayList<>());
-    private final AtomicInteger commitIndex = new AtomicInteger(0);
-    private final AtomicInteger lastApplied = new AtomicInteger(0);
+    private final AtomicInteger commitIndex = new AtomicInteger(-1);
+    private final AtomicInteger lastApplied = new AtomicInteger(-1);
     
 
     private final Map<String, Integer> nextIndex = new ConcurrentHashMap<>();

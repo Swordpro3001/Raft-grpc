@@ -57,8 +57,8 @@ class RaftNodeTest {
         assertEquals(NodeState.FOLLOWER, raftNode.getState());
         assertEquals(0, raftNode.getCurrentTerm().get());
         assertNull(raftNode.getVotedFor());
-        assertEquals(0, raftNode.getCommitIndex().get());
-        assertEquals(0, raftNode.getLastApplied().get());
+        assertEquals(-1, raftNode.getCommitIndex().get());
+        assertEquals(-1, raftNode.getLastApplied().get());
         assertTrue(raftNode.getStateMachine().isEmpty());
         assertTrue(raftNode.getRaftLog().isEmpty());
     }

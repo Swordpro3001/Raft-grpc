@@ -450,20 +450,17 @@
             { id: 'node5', port: 8085 }
         ];
         
-        // Cache for previous state to detect changes
         let previousStates = {};
         let refreshInterval = null;
         let isPageVisible = true;
         
-        // Detect if page is visible (don't poll when hidden)
         document.addEventListener('visibilitychange', () => {
             isPageVisible = !document.hidden;
             if (isPageVisible) {
-                refreshStatus(); // Immediate refresh when page becomes visible
+                refreshStatus(); 
             }
         });
         
-        // Try to find any available node for management operations
         async function findAvailableManagerNode() {
             for (const node of nodes) {
                 try {
