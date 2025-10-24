@@ -86,9 +86,9 @@ gradlew bootRun --args="--spring.profiles.active=node3"
 
 ### Open the Dashboard
 
-Open `index.html` in your browser or navigate to:
+The `index.html` in should open automaticly in the browser or open:
 
-* [http://localhost:8081](http://localhost:8081) (if you serve the HTML file via a web server)
+* [http://localhost:8081/index.html](http://localhost:8081/index.html)
 
 ## API Endpoints
 

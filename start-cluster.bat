@@ -38,11 +38,9 @@ timeout /t 5 /nobreak >nul
 
 echo.
 echo All nodes started!
-echo Opening dashboard in browser...
-start "" "index.html"
 
 echo.
-echo Dashboard: http://localhost:8081 (or open index.html)
+echo Dashboard: http://localhost:8081
 echo Node 1: http://localhost:8081/api/status
 echo Node 2: http://localhost:8082/api/status
 echo Node 3: http://localhost:8083/api/status
