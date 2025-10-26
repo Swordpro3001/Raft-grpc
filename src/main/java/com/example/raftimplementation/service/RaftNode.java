@@ -457,6 +457,117 @@ public class RaftNode {
         return true;
     }
     
+    /**
+     * Add a server to the cluster (membership change).
+     * Uses the two-phase approach from the Raft paper:
+     * 1. Add C_old,new configuration
+     * 2. After it's committed, add C_new configuration
+     */
+    public synchronized boolean addServer(com.example.raftimplementation.model.ServerInfo serverInfo) {
+        if (state != NodeState.LEADER) {
+            log.warn("Not a leader, cannot add server");
+            return false;
+        }
+        
+        log.info("Leader initiating server addition: {}", serverInfo);
+        logEvent(RaftEvent.EventType.SERVER_ADDED, 
+            "Initiating addition of server: " + serverInfo.getNodeId());
+        
+        // Create joint consensus configuration C_old,new
+        Set<String> oldServers = new HashSet<>(stubs.keySet());
+        oldServers.add(config.getNodeId()); // Include self
+        
+        Set<String> newServers = new HashSet<>(oldServers);
+        newServers.add(serverInfo.getNodeId());
+        
+        com.example.raftimplementation.model.ClusterConfiguration jointConfig = 
+            com.example.raftimplementation.model.ClusterConfiguration.createJoint(oldServers, newServers);
+        
+        // Add C_old,new to log
+        com.example.raftimplementation.model.LogEntry configEntry = 
+            new com.example.raftimplementation.model.LogEntry(currentTerm.get(), null, jointConfig);
+        raftLog.add(configEntry);
+        
+        logEvent(RaftEvent.EventType.MEMBERSHIP_CHANGE_START, 
+            "Added C_old,new configuration entry to log");
+        
+        // Connect to new server
+        try {
+            ManagedChannel channel = ManagedChannelBuilder
+                .forAddress(serverInfo.getHost(), serverInfo.getGrpcPort())
+                .usePlaintext()
+                .build();
+            channels.put(serverInfo.getNodeId(), channel);
+            stubs.put(serverInfo.getNodeId(), RaftServiceGrpc.newBlockingStub(channel));
+            nextIndex.put(serverInfo.getNodeId(), raftLog.size());
+            matchIndex.put(serverInfo.getNodeId(), -1);
+            log.info("Connected to new server: {}", serverInfo);
+        } catch (Exception e) {
+            log.error("Failed to connect to new server: {}", serverInfo, e);
+            return false;
+        }
+        
+        sendHeartbeats();
+        
+        // TODO: When C_old,new is committed, add C_new configuration
+        // For now, this simplified version just adds the server
+        
+        return true;
+    }
+    
+    /**
+     * Remove a server from the cluster (membership change).
+     */
+    public synchronized boolean removeServer(String nodeId) {
+        if (state != NodeState.LEADER) {
+            log.warn("Not a leader, cannot remove server");
+            return false;
+        }
+        
+        if (nodeId.equals(config.getNodeId())) {
+            log.warn("Cannot remove self from cluster");
+            return false;
+        }
+        
+        log.info("Leader initiating server removal: {}", nodeId);
+        logEvent(RaftEvent.EventType.SERVER_REMOVED, 
+            "Initiating removal of server: " + nodeId);
+        
+        // Create joint consensus configuration C_old,new
+        Set<String> oldServers = new HashSet<>(stubs.keySet());
+        oldServers.add(config.getNodeId()); // Include self
+        
+        Set<String> newServers = new HashSet<>(oldServers);
+        newServers.remove(nodeId);
+        
+        com.example.raftimplementation.model.ClusterConfiguration jointConfig = 
+            com.example.raftimplementation.model.ClusterConfiguration.createJoint(oldServers, newServers);
+        
+        // Add C_old,new to log
+        com.example.raftimplementation.model.LogEntry configEntry = 
+            new com.example.raftimplementation.model.LogEntry(currentTerm.get(), null, jointConfig);
+        raftLog.add(configEntry);
+        
+        logEvent(RaftEvent.EventType.MEMBERSHIP_CHANGE_START, 
+            "Added C_old,new configuration entry to log");
+        
+        sendHeartbeats();
+        
+        // TODO: When C_old,new is committed, add C_new and disconnect from removed server
+        // For now, this simplified version keeps the connection
+        
+        return true;
+    }
+    
+    /**
+     * Get the current cluster configuration.
+     */
+    public Set<String> getClusterMembers() {
+        Set<String> members = new HashSet<>(stubs.keySet());
+        members.add(config.getNodeId());
+        return members;
+    }
+    
     public Map<String, Object> getStatus() {
         Map<String, Object> status = new HashMap<>();
         status.put("nodeId", config.getNodeId());

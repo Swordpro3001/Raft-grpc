@@ -26,6 +26,21 @@ message VoteResponse {
 message LogEntry {
   int32 term = 1;
   string command = 2;
+  // Configuration change entry
+  ConfigurationEntry configuration = 3;
+}
+
+message ConfigurationEntry {
+  repeated ServerEntry oldServers = 1;
+  repeated ServerEntry newServers = 2;
+  bool isJoint = 3;
+}
+
+message ServerEntry {
+  string nodeId = 1;
+  string host = 2;
+  int32 grpcPort = 3;
+  int32 httpPort = 4;
 }
 
 message AppendEntriesRequest {
