@@ -31,8 +31,8 @@ public class RaftNode {
     private volatile String votedFor = null;
     private volatile String currentLeader = null;
     private final List<com.example.raftimplementation.model.LogEntry> raftLog = Collections.synchronizedList(new ArrayList<>());
-    private final AtomicInteger commitIndex = new AtomicInteger(-1);
-    private final AtomicInteger lastApplied = new AtomicInteger(-1);
+    private final AtomicInteger commitIndex = new AtomicInteger(0);
+    private final AtomicInteger lastApplied = new AtomicInteger(0);
     
 
     private final Map<String, Integer> nextIndex = new ConcurrentHashMap<>();
@@ -50,6 +50,9 @@ public class RaftNode {
     private volatile long lastHeartbeat = System.currentTimeMillis();
     private ScheduledFuture<?> electionTask;
     private ScheduledFuture<?> heartbeatTask;
+    
+    // Suspension state: keeps Spring Boot running but pauses Raft participation
+    private volatile boolean suspended = false;
     
     private static final int ELECTION_TIMEOUT_MIN = 3000;
     private static final int ELECTION_TIMEOUT_MAX = 5000;
@@ -96,6 +99,72 @@ public class RaftNode {
         channels.values().forEach(ManagedChannel::shutdown);
     }
     
+    /**
+     * Suspends Raft participation while keeping Spring Boot application running.
+     * Stops heartbeats, elections, and command processing but keeps the app alive.
+     */
+    public synchronized void suspend() {
+        if (suspended) {
+            log.warn("Node {} is already suspended", config.getNodeId());
+            return;
+        }
+        
+        log.info("Suspending Raft node: {}", config.getNodeId());
+        suspended = true;
+        
+        // Cancel timers to stop participating in Raft protocol
+        if (electionTask != null) {
+            electionTask.cancel(true);
+            electionTask = null;
+        }
+        if (heartbeatTask != null) {
+            heartbeatTask.cancel(true);
+            heartbeatTask = null;
+        }
+        
+        // Become follower and clear leadership
+        if (state == NodeState.LEADER) {
+            state = NodeState.FOLLOWER;
+        }
+        currentLeader = null;
+        votedFor = null;
+        
+        logEvent(com.example.raftimplementation.model.RaftEvent.EventType.STATE_CHANGE, 
+            "Node SUSPENDED - Spring Boot running, Raft paused");
+        
+        log.info("Node {} suspended successfully. Spring Boot is still running.", config.getNodeId());
+    }
+    
+    /**
+     * Resumes Raft participation after suspension.
+     * Restarts election timer and rejoins the cluster.
+     */
+    public synchronized void resume() {
+        if (!suspended) {
+            log.warn("Node {} is not suspended", config.getNodeId());
+            return;
+        }
+        
+        log.info("Resuming Raft node: {}", config.getNodeId());
+        suspended = false;
+        
+        // Restart election timer to rejoin cluster
+        state = NodeState.FOLLOWER;
+        startElectionTimer();
+        
+        logEvent(com.example.raftimplementation.model.RaftEvent.EventType.STATE_CHANGE, 
+            "Node RESUMED - Rejoining cluster as FOLLOWER");
+        
+        log.info("Node {} resumed successfully. Rejoining cluster.", config.getNodeId());
+    }
+    
+    /**
+     * Checks if the node is currently suspended.
+     */
+    public boolean isSuspended() {
+        return suspended;
+    }
+    
     private void logEvent(com.example.raftimplementation.model.RaftEvent.EventType type, String description) {
         com.example.raftimplementation.model.RaftEvent event = new com.example.raftimplementation.model.RaftEvent(
             java.time.LocalDateTime.now(),
@@ -132,7 +201,7 @@ public class RaftNode {
     }
     
     private void startElection() {
-        if (state == NodeState.LEADER) {
+        if (suspended || state == NodeState.LEADER) {
             return;
         }
         
@@ -207,7 +276,7 @@ public class RaftNode {
 
         for (String peerId : stubs.keySet()) {
             nextIndex.put(peerId, raftLog.size());
-            matchIndex.put(peerId, -1);
+            matchIndex.put(peerId, 0);
         }
         
         if (heartbeatTask != null) {
@@ -305,30 +374,117 @@ public class RaftNode {
         if (majorityIndex < indices.size()) {
             int newCommitIndex = indices.get(majorityIndex);
             
-            // Allow commitIndex to be set to 0 for first entry
-            if (newCommitIndex >= commitIndex.get() && 
+            // newCommitIndex is the actual index of the entry
+            // We need to increment by 1 because commitIndex represents "how many entries are committed"
+            // When first entry at index 0 is replicated, we set commitIndex = 1
+            if (newCommitIndex >= 0 && 
                 newCommitIndex < raftLog.size() && 
                 raftLog.get(newCommitIndex).getTerm() == currentTerm.get()) {
-                commitIndex.set(newCommitIndex);
-                log.debug("Updated commit index to {}", newCommitIndex);
-                applyCommittedEntries();
+                int newCommitCount = newCommitIndex + 1;
+                if (newCommitCount > commitIndex.get()) {
+                    commitIndex.set(newCommitCount);
+                    log.debug("Updated commit index to {}", newCommitCount);
+                    applyCommittedEntries();
+                }
             }
         }
     }
     
     private void applyCommittedEntries() {
+        // lastApplied = count of applied entries (starts at 0)
+        // commitIndex = count of committed entries
+        // Apply entries from index lastApplied to index (commitIndex - 1)
         while (lastApplied.get() < commitIndex.get()) {
-            int indexToApply = lastApplied.incrementAndGet();
+            int indexToApply = lastApplied.get();
             if (indexToApply < raftLog.size()) {
                 com.example.raftimplementation.model.LogEntry entry = raftLog.get(indexToApply);
-                stateMachine.add(entry.getCommand());
-                log.debug("Applied entry to state machine: {}", entry.getCommand());
+                
+                // Check if this is a configuration entry
+                if (entry.isConfigurationEntry()) {
+                    applyConfigurationEntry(entry, indexToApply);
+                } else if (entry.getCommand() != null) {
+                    // Regular command entry (skip if command is null)
+                    stateMachine.add(entry.getCommand());
+                    log.debug("Applied entry at index {} to state machine: {}", indexToApply, entry.getCommand());
+                }
             }
+            lastApplied.incrementAndGet();
         }
+    }
+    
+    /**
+     * Apply a configuration change entry.
+     * When C_old,new is committed, we add C_new to the log.
+     */
+    private void applyConfigurationEntry(com.example.raftimplementation.model.LogEntry entry, int index) {
+        com.example.raftimplementation.model.ClusterConfiguration config = entry.getConfiguration();
+        
+        log.info("Applying configuration entry at index {}: {}", index, config);
+        
+        if (config.isJoint()) {
+            // C_old,new has been committed
+            // Now add C_new configuration entry (only leader does this)
+            if (state == NodeState.LEADER) {
+                Set<String> newServers = config.getNewServers();
+                
+                com.example.raftimplementation.model.ClusterConfiguration newConfig = 
+                    com.example.raftimplementation.model.ClusterConfiguration.createNew(newServers);
+                
+                com.example.raftimplementation.model.LogEntry newConfigEntry = 
+                    new com.example.raftimplementation.model.LogEntry(currentTerm.get(), null, newConfig);
+                
+                raftLog.add(newConfigEntry);
+                
+                logEvent(RaftEvent.EventType.MEMBERSHIP_CHANGE_COMMITTED, 
+                    "C_old,new committed. Added C_new configuration to log");
+                
+                sendHeartbeats();
+            }
+        } else {
+            // C_new has been committed
+            // Finalize the configuration change
+            Set<String> newServers = config.getNewServers();
+            Set<String> oldServers = new HashSet<>(stubs.keySet());
+            oldServers.add(this.config.getNodeId());
+            
+            // Disconnect from removed servers
+            for (String nodeId : oldServers) {
+                if (!newServers.contains(nodeId) && !nodeId.equals(this.config.getNodeId())) {
+                    disconnectFromServer(nodeId);
+                    logEvent(RaftEvent.EventType.MEMBERSHIP_CHANGE_COMMITTED,
+                        "C_new committed. Disconnected from removed server: " + nodeId);
+                }
+            }
+            
+            log.info("Configuration change finalized. New cluster: {}", newServers);
+        }
+    }
+    
+    /**
+     * Disconnect from a server and clean up resources.
+     */
+    private void disconnectFromServer(String nodeId) {
+        ManagedChannel channel = channels.remove(nodeId);
+        if (channel != null) {
+            channel.shutdown();
+            log.info("Disconnected from server: {}", nodeId);
+        }
+        stubs.remove(nodeId);
+        nextIndex.remove(nodeId);
+        matchIndex.remove(nodeId);
     }
     
     public VoteResponse handleVoteRequest(VoteRequest request) {
         log.info("Received vote request from {} for term {}", request.getCandidateId(), request.getTerm());
+        
+        // Deny votes when suspended
+        if (suspended) {
+            log.info("Denying vote request - node is suspended");
+            return VoteResponse.newBuilder()
+                .setTerm(currentTerm.get())
+                .setVoteGranted(false)
+                .build();
+        }
         
         if (request.getTerm() > currentTerm.get()) {
             becomeFollower(request.getTerm());
@@ -371,6 +527,15 @@ public class RaftNode {
     }
     
     public AppendEntriesResponse handleAppendEntries(AppendEntriesRequest request) {
+        // Reject AppendEntries when suspended
+        if (suspended) {
+            log.debug("Rejecting AppendEntries - node is suspended");
+            return AppendEntriesResponse.newBuilder()
+                .setTerm(currentTerm.get())
+                .setSuccess(false)
+                .build();
+        }
+        
         lastHeartbeat = System.currentTimeMillis();
         
         if (request.getTerm() > currentTerm.get()) {
@@ -439,6 +604,11 @@ public class RaftNode {
     }
     
     public boolean submitCommand(String command) {
+        if (suspended) {
+            log.warn("Cannot submit command - node is suspended");
+            return false;
+        }
+        
         if (state != NodeState.LEADER) {
             log.warn("Not a leader, cannot submit command");
             return false;
@@ -500,7 +670,7 @@ public class RaftNode {
             channels.put(serverInfo.getNodeId(), channel);
             stubs.put(serverInfo.getNodeId(), RaftServiceGrpc.newBlockingStub(channel));
             nextIndex.put(serverInfo.getNodeId(), raftLog.size());
-            matchIndex.put(serverInfo.getNodeId(), -1);
+            matchIndex.put(serverInfo.getNodeId(), 0);
             log.info("Connected to new server: {}", serverInfo);
         } catch (Exception e) {
             log.error("Failed to connect to new server: {}", serverInfo, e);
@@ -508,9 +678,6 @@ public class RaftNode {
         }
         
         sendHeartbeats();
-        
-        // TODO: When C_old,new is committed, add C_new configuration
-        // For now, this simplified version just adds the server
         
         return true;
     }
@@ -553,9 +720,6 @@ public class RaftNode {
         
         sendHeartbeats();
         
-        // TODO: When C_old,new is committed, add C_new and disconnect from removed server
-        // For now, this simplified version keeps the connection
-        
         return true;
     }
     
@@ -571,12 +735,13 @@ public class RaftNode {
     public Map<String, Object> getStatus() {
         Map<String, Object> status = new HashMap<>();
         status.put("nodeId", config.getNodeId());
-        status.put("state", state.name());
+        status.put("state", suspended ? "SUSPENDED" : state.name());
         status.put("currentTerm", currentTerm.get());
         status.put("currentLeader", currentLeader);
         status.put("commitIndex", commitIndex.get());
         status.put("logSize", raftLog.size());
         status.put("stateMachine", new ArrayList<>(stateMachine));
+        status.put("suspended", suspended);
         return status;
     }
 }

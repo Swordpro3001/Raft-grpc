@@ -5,9 +5,11 @@ import com.example.raftimplementation.model.ServerInfo;
 import com.example.raftimplementation.service.ClusterManager;
 import com.example.raftimplementation.service.RaftNode;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -16,6 +18,7 @@ import java.util.Set;
 @RequestMapping("/api")
 @RequiredArgsConstructor
 @CrossOrigin(origins = "*")
+@Slf4j
 public class RaftController {
     
     private final RaftNode raftNode;
@@ -69,21 +72,40 @@ public class RaftController {
      */
     @PostMapping("/membership/add")
     public ResponseEntity<Map<String, Object>> addServer(@RequestBody ServerInfo serverInfo) {
-        boolean success = raftNode.addServer(serverInfo);
-        
-        if (success) {
-            // Register in cluster manager
-            clusterManager.registerServer(serverInfo);
+        try {
+            boolean success = raftNode.addServer(serverInfo);
             
-            return ResponseEntity.ok(Map.of(
-                "success", true,
-                "message", "Server " + serverInfo.getNodeId() + " addition initiated",
-                "server", serverInfo
-            ));
-        } else {
-            return ResponseEntity.ok(Map.of(
+            if (success) {
+                // Register in cluster manager
+                clusterManager.registerServer(serverInfo);
+                
+                Map<String, Object> response = new HashMap<>();
+                response.put("success", true);
+                response.put("message", "Server " + serverInfo.getNodeId() + " addition initiated");
+                response.put("nodeId", serverInfo.getNodeId());
+                response.put("host", serverInfo.getHost());
+                response.put("grpcPort", serverInfo.getGrpcPort());
+                response.put("httpPort", serverInfo.getHttpPort());
+                
+                return ResponseEntity.ok(response);
+            } else {
+                return ResponseEntity.ok(Map.of(
+                    "success", false,
+                    "message", "Failed to add server. Only leader can modify membership."
+                ));
+            }
+        } catch (Exception e) {
+            log.error("Error adding server: {}", serverInfo, e);
+            
+            String errorMessage = e.getMessage();
+            if (errorMessage == null) {
+                errorMessage = e.getClass().getSimpleName() + " occurred";
+            }
+            
+            return ResponseEntity.status(500).body(Map.of(
                 "success", false,
-                "message", "Failed to add server. Only leader can modify membership."
+                "message", "Error adding server: " + errorMessage,
+                "error", e.getClass().getSimpleName()
             ));
         }
     }
@@ -119,6 +141,38 @@ public class RaftController {
         return ResponseEntity.ok(Map.of(
             "members", members,
             "clusterSize", members.size()
+        ));
+    }
+    
+    /**
+     * Suspend Raft participation while keeping Spring Boot running.
+     * Useful for temporarily taking a node offline without killing the process.
+     */
+    @PostMapping("/suspend")
+    public ResponseEntity<Map<String, Object>> suspend() {
+        raftNode.suspend();
+        
+        return ResponseEntity.ok(Map.of(
+            "success", true,
+            "message", "Node suspended. Spring Boot is still running, but Raft participation paused.",
+            "nodeId", raftNode.getConfig().getNodeId(),
+            "suspended", true
+        ));
+    }
+    
+    /**
+     * Resume Raft participation after suspension.
+     * Node will rejoin the cluster as a follower.
+     */
+    @PostMapping("/resume")
+    public ResponseEntity<Map<String, Object>> resume() {
+        raftNode.resume();
+        
+        return ResponseEntity.ok(Map.of(
+            "success", true,
+            "message", "Node resumed. Rejoining cluster as FOLLOWER.",
+            "nodeId", raftNode.getConfig().getNodeId(),
+            "suspended", false
         ));
     }
 }

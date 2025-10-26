@@ -160,7 +160,32 @@
             background: #c82333;
         }
         
-        .btn-start:disabled, .btn-stop:disabled {
+        .btn-suspend {
+            background: #ffc107;
+            color: #000;
+        }
+        
+        .btn-suspend:hover {
+            background: #e0a800;
+        }
+        
+        .btn-resume {
+            background: #17a2b8;
+        }
+        
+        .btn-resume:hover {
+            background: #138496;
+        }
+        
+        .btn-remove {
+            background: #6c757d;
+        }
+        
+        .btn-remove:hover {
+            background: #5a6268;
+        }
+        
+        .btn-start:disabled, .btn-stop:disabled, .btn-suspend:disabled, .btn-resume:disabled {
             background: #6c757d;
             cursor: not-allowed;
             transform: none;
@@ -197,6 +222,11 @@
         
         .state-CANDIDATE {
             background: #fff3cd;
+            color: #856404;
+        }
+        
+        .state-SUSPENDED {
+            background: #ffc107;
             color: #856404;
         }
         
@@ -432,6 +462,29 @@
             <div id="commandMessage" class="message"></div>
         </div>
         
+        <div class="command-section">
+            <h2>🔧 Cluster Management</h2>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                <div>
+                    <h3 style="color: #667eea; margin-bottom: 10px;">Add Node to Cluster</h3>
+                    <div style="display: flex; flex-direction: column; gap: 8px;">
+                        <input type="text" id="newNodeId" placeholder="Node ID (z.B. node6)">
+                        <input type="text" id="newNodeHost" placeholder="Host (z.B. localhost)" value="localhost">
+                        <input type="text" id="newNodeGrpcPort" placeholder="gRPC Port (z.B. 50056)">
+                        <input type="text" id="newNodeHttpPort" placeholder="HTTP Port (z.B. 8086)">
+                        <button onclick="addNode()">➕ Add Node</button>
+                    </div>
+                </div>
+                <div>
+                    <h3 style="color: #667eea; margin-bottom: 10px;">Cluster Info</h3>
+                    <div id="clusterInfo" style="background: #f8f9fa; padding: 15px; border-radius: 8px; font-family: monospace; font-size: 14px;">
+                        Loading...
+                    </div>
+                </div>
+            </div>
+            <div id="clusterMessage" class="message"></div>
+        </div>
+        
         <h2 style="color: white; margin-bottom: 15px; text-align: center;">📊 Cluster Nodes</h2>
         
         <div id="nodesContainer" class="nodes-grid"></div>
@@ -498,37 +551,33 @@
                 return;
             }
             
-            let success = false;
-            let responseMsg = '';
+            // Find an available manager node
+            const managerPort = await findAvailableManagerNode();
             
-            for (const node of nodes) {
-                try {
-                    const response = await fetch(`http://localhost:${node.port}/api/command`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ command })
-                    });
-                    
-                    const data = await response.json();
-                    
-                    if (data.success) {
-                        success = true;
-                        responseMsg = `✓ Command erfolgreich an ${node.id} (Leader) gesendet`;
-                        break;
-                    } else {
-                        responseMsg = data.message || 'Command fehlgeschlagen';
-                    }
-                } catch (error) {
-                    console.log(`Node ${node.id} nicht erreichbar`);
-                }
+            if (!managerPort) {
+                showMessage('✗ Kein Node verfügbar für Command-Verarbeitung', 'error');
+                return;
             }
             
-            if (success) {
-                showMessage(responseMsg, 'success');
-                input.value = '';
-                setTimeout(refreshStatus, 500);
-            } else {
-                showMessage(responseMsg || 'Kein Leader gefunden. Warte auf Leader-Election...', 'error');
+            try {
+                // Send command to NodeManagerController which will forward to leader
+                const response = await fetch(`http://localhost:${managerPort}/api/cluster/command`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showMessage(`✓ Command erfolgreich verarbeitet (Leader: ${data.currentLeader || 'unknown'})`, 'success');
+                    input.value = '';
+                    setTimeout(refreshStatus, 500);
+                } else {
+                    showMessage(`✗ ${data.message}`, 'error');
+                }
+            } catch (error) {
+                showMessage(`✗ Fehler beim Senden des Commands: ${error.message}`, 'error');
             }
         }
         
@@ -643,6 +692,162 @@
             }
         }
         
+        async function suspendNode(nodeId) {
+            const managerPort = await findAvailableManagerNode();
+            
+            if (!managerPort) {
+                showMessage(`✗ Kein Node verfügbar für Management-Operationen`, 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`http://localhost:${managerPort}/api/nodes/${nodeId}/suspend`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                if (data.success) {
+                    showMessage(`✓ ${nodeId} wurde suspendiert`, 'success');
+                    setTimeout(refreshStatus, 500);
+                } else {
+                    showMessage(`✗ ${data.message}`, 'error');
+                }
+            } catch (error) {
+                showMessage(`✗ Fehler beim Suspendieren von ${nodeId}: ${error.message}`, 'error');
+            }
+        }
+        
+        async function resumeNode(nodeId) {
+            const managerPort = await findAvailableManagerNode();
+            
+            if (!managerPort) {
+                showMessage(`✗ Kein Node verfügbar für Management-Operationen`, 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`http://localhost:${managerPort}/api/nodes/${nodeId}/resume`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                if (data.success) {
+                    showMessage(`✓ ${nodeId} wurde wiederaufgenommen`, 'success');
+                    setTimeout(refreshStatus, 500);
+                } else {
+                    showMessage(`✗ ${data.message}`, 'error');
+                }
+            } catch (error) {
+                showMessage(`✗ Fehler beim Wiederaufnehmen von ${nodeId}: ${error.message}`, 'error');
+            }
+        }
+        
+        async function addNode() {
+            const nodeId = document.getElementById('newNodeId').value.trim();
+            const host = document.getElementById('newNodeHost').value.trim();
+            const grpcPort = document.getElementById('newNodeGrpcPort').value.trim();
+            const httpPort = document.getElementById('newNodeHttpPort').value.trim();
+            
+            if (!nodeId || !host || !grpcPort || !httpPort) {
+                showClusterMessage('Bitte alle Felder ausfüllen', 'error');
+                return;
+            }
+            
+            const managerPort = await findAvailableManagerNode();
+            
+            if (!managerPort) {
+                showClusterMessage(`✗ Kein Node verfügbar für Management-Operationen`, 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`http://localhost:${managerPort}/api/cluster/add`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        nodeId: nodeId,
+                        host: host,
+                        grpcPort: parseInt(grpcPort),
+                        httpPort: parseInt(httpPort)
+                    })
+                });
+                const data = await response.json();
+                
+                if (data.success) {
+                    showClusterMessage(`✓ ${nodeId} wurde zum Cluster hinzugefügt`, 'success');
+                    // Clear form
+                    document.getElementById('newNodeId').value = '';
+                    document.getElementById('newNodeGrpcPort').value = '';
+                    document.getElementById('newNodeHttpPort').value = '';
+                    
+                    // Add to nodes array for monitoring
+                    if (!nodes.find(n => n.id === nodeId)) {
+                        nodes.push({ id: nodeId, port: parseInt(httpPort) });
+                    }
+                    
+                    setTimeout(refreshStatus, 1000);
+                } else {
+                    showClusterMessage(`✗ ${data.message}`, 'error');
+                }
+            } catch (error) {
+                showClusterMessage(`✗ Fehler beim Hinzufügen von ${nodeId}: ${error.message}`, 'error');
+            }
+        }
+        
+        async function removeNode(nodeId) {
+            const confirmed = confirm(
+                `⚠️ Node ${nodeId} aus dem Cluster entfernen?\n\n` +
+                'Dies wird den Node dauerhaft aus dem Raft-Cluster entfernen.\n' +
+                'Der Prozess läuft weiter, nimmt aber nicht mehr teil.\n\n' +
+                'Fortfahren?'
+            );
+            
+            if (!confirmed) {
+                return;
+            }
+            
+            const managerPort = await findAvailableManagerNode();
+            
+            if (!managerPort) {
+                showMessage(`✗ Kein Node verfügbar für Management-Operationen`, 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`http://localhost:${managerPort}/api/cluster/remove/${nodeId}`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                if (data.success) {
+                    showMessage(`✓ ${nodeId} wurde aus dem Cluster entfernt`, 'success');
+                    
+                    // Remove from nodes array
+                    const index = nodes.findIndex(n => n.id === nodeId);
+                    if (index !== -1) {
+                        nodes.splice(index, 1);
+                    }
+                    
+                    setTimeout(refreshStatus, 1000);
+                } else {
+                    showMessage(`✗ ${data.message}`, 'error');
+                }
+            } catch (error) {
+                showMessage(`✗ Fehler beim Entfernen von ${nodeId}: ${error.message}`, 'error');
+            }
+        }
+        
+        function showClusterMessage(text, type) {
+            const message = document.getElementById('clusterMessage');
+            message.textContent = text;
+            message.className = `message ${type}`;
+            message.style.display = 'block';
+            
+            setTimeout(() => {
+                message.style.display = 'none';
+            }, 5000);
+        }
+        
         function hasStateChanged(nodeId, newStatus) {
             const prev = previousStates[nodeId];
             if (!prev) return true; // First time
@@ -680,6 +885,7 @@
         
         function renderNodeContent(status) {
             const isOffline = status.error || status.state === 'OFFLINE';
+            const isSuspended = status.state === 'SUSPENDED' || status.suspended;
             const nodeRunning = !isOffline;
             const events = status.events || [];
             
@@ -699,8 +905,14 @@
                         <button class="btn-start" onclick="startNode('${status.nodeId}')" ${nodeRunning ? 'disabled' : ''}>
                             ▶ Start
                         </button>
-                        <button class="btn-stop" onclick="stopNode('${status.nodeId}')" ${!nodeRunning ? 'disabled' : ''}>
-                            ⏹ Stop
+                        <button class="btn-suspend" onclick="suspendNode('${status.nodeId}')" ${!nodeRunning || isSuspended ? 'disabled' : ''}>
+                            ⏸ Suspend
+                        </button>
+                        <button class="btn-resume" onclick="resumeNode('${status.nodeId}')" ${!isSuspended ? 'disabled' : ''}>
+                            ▶ Resume
+                        </button>
+                        <button class="btn-remove" onclick="removeNode('${status.nodeId}')" ${!nodeRunning ? 'disabled' : ''}>
+                            ✖ Remove
                         </button>
                     </div>
                     
@@ -769,6 +981,28 @@
             statuses.forEach(status => {
                 updateNodeCard(status.nodeId, status);
             });
+            
+            // Update cluster info
+            updateClusterInfo(statuses);
+        }
+        
+        function updateClusterInfo(statuses) {
+            const runningNodes = statuses.filter(s => !s.error && s.state !== 'OFFLINE').length;
+            const suspendedNodes = statuses.filter(s => s.state === 'SUSPENDED' || s.suspended).length;
+            const leaders = statuses.filter(s => s.state === 'LEADER').length;
+            const currentLeader = statuses.find(s => s.state === 'LEADER');
+            
+            const clusterInfo = document.getElementById('clusterInfo');
+            if (clusterInfo) {
+                clusterInfo.innerHTML = `
+                    <div><strong>Total Nodes:</strong> ${nodes.length}</div>
+                    <div><strong>Running:</strong> ${runningNodes}</div>
+                    <div><strong>Suspended:</strong> ${suspendedNodes}</div>
+                    <div><strong>Offline:</strong> ${nodes.length - runningNodes - suspendedNodes}</div>
+                    <div><strong>Current Leader:</strong> ${currentLeader ? currentLeader.nodeId : 'None'}</div>
+                    <div><strong>Leader Count:</strong> ${leaders} ${leaders > 1 ? '⚠️ Split Brain!' : ''}</div>
+                `;
+            }
         }
         
         // Enter-Taste für Command-Submit
@@ -781,6 +1015,10 @@
         // Make functions global
         window.startNode = startNode;
         window.stopNode = stopNode;
+        window.suspendNode = suspendNode;
+        window.resumeNode = resumeNode;
+        window.addNode = addNode;
+        window.removeNode = removeNode;
         window.submitCommand = submitCommand;
         window.refreshStatus = refreshStatus;
         

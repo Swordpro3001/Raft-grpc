@@ -10,34 +10,35 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo.
-echo Starting Node 1 on port 8081 (gRPC: 9091)...
-start "Raft-Node1" cmd /k "gradlew.bat bootRun --args='--spring.profiles.active=node1'"
+echo Starting Nodes silently in background...
+
+rem === Node 1 ===
+powershell -WindowStyle Hidden -Command "Start-Process 'cmd.exe' -ArgumentList '/c gradlew.bat bootRun --args=--spring.profiles.active=node1' -WindowStyle Hidden"
 
 timeout /t 3 /nobreak >nul
 
-echo Starting Node 2 on port 8082 (gRPC: 9092)...
-start "Raft-Node2" cmd /k "gradlew.bat bootRun --args='--spring.profiles.active=node2'"
+rem === Node 2 ===
+powershell -WindowStyle Hidden -Command "Start-Process 'cmd.exe' -ArgumentList '/c gradlew.bat bootRun --args=--spring.profiles.active=node2' -WindowStyle Hidden"
 
 timeout /t 3 /nobreak >nul
 
-echo Starting Node 3 on port 8083 (gRPC: 9093)...
-start "Raft-Node3" cmd /k "gradlew.bat bootRun --args='--spring.profiles.active=node3'"
+rem === Node 3 ===
+powershell -WindowStyle Hidden -Command "Start-Process 'cmd.exe' -ArgumentList '/c gradlew.bat bootRun --args=--spring.profiles.active=node3' -WindowStyle Hidden"
 
 timeout /t 3 /nobreak >nul
 
-echo Starting Node 4 on port 8084 (gRPC: 9094)...
-start "Raft-Node4" cmd /k "gradlew.bat bootRun --args='--spring.profiles.active=node4'"
+rem === Node 4 ===
+powershell -WindowStyle Hidden -Command "Start-Process 'cmd.exe' -ArgumentList '/c gradlew.bat bootRun --args=--spring.profiles.active=node4' -WindowStyle Hidden"
 
 timeout /t 3 /nobreak >nul
 
-echo Starting Node 5 on port 8085 (gRPC: 9095)...
-start "Raft-Node5" cmd /k "gradlew.bat bootRun --args='--spring.profiles.active=node5'"
+rem === Node 5 ===
+powershell -WindowStyle Hidden -Command "Start-Process 'cmd.exe' -ArgumentList '/c gradlew.bat bootRun --args=--spring.profiles.active=node5' -WindowStyle Hidden"
 
 timeout /t 5 /nobreak >nul
 
 echo.
-echo All nodes started!
+echo All nodes started in background!
 
 echo.
 echo Dashboard: http://localhost:8081

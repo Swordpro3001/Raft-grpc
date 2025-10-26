@@ -53,6 +53,17 @@ public class ClusterConfiguration {
     }
     
     /**
+     * Creates a new (final) configuration after joint consensus.
+     */
+    public static ClusterConfiguration createNew(Set<String> newServers) {
+        ClusterConfiguration config = new ClusterConfiguration();
+        config.oldServers = new HashSet<>(newServers);
+        config.newServers = new HashSet<>(newServers);
+        config.isJoint = false;
+        return config;
+    }
+    
+    /**
      * Returns all servers in the configuration (union of old and new).
      */
     public Set<String> getAllServers() {
