@@ -4,6 +4,7 @@ import com.example.raftimplementation.model.ServerInfo;
 import jakarta.annotation.PostConstruct;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
 
 import java.util.Map;
@@ -16,6 +17,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * and provides methods to query and update membership.
  */
 @Service
+@ConditionalOnProperty(name = "raft.node.enabled", havingValue = "true", matchIfMissing = true)
 @Slf4j
 @Getter
 public class ClusterManager {

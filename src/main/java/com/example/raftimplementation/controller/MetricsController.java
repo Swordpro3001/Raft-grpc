@@ -5,6 +5,7 @@ import com.example.raftimplementation.model.NodeState;
 import com.example.raftimplementation.model.RaftEvent;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.*;
@@ -16,6 +17,7 @@ import java.util.stream.Collectors;
 @RestController
 @RequestMapping("/api/metrics")
 @RequiredArgsConstructor
+@ConditionalOnProperty(name = "raft.node.enabled", havingValue = "true", matchIfMissing = true)
 @Slf4j
 public class MetricsController {
     

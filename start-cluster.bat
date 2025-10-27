@@ -12,6 +12,12 @@ if errorlevel 1 (
 
 echo Starting Nodes silently in background...
 
+rem === Dashboard Client ===
+echo Starting Dashboard Client...
+powershell -WindowStyle Hidden -Command "Start-Process 'cmd.exe' -ArgumentList '/c gradlew.bat bootRun --args=--spring.profiles.active=client' -WindowStyle Hidden"
+
+timeout /t 3 /nobreak >nul
+
 rem === Node 1 ===
 powershell -WindowStyle Hidden -Command "Start-Process 'cmd.exe' -ArgumentList '/c gradlew.bat bootRun --args=--spring.profiles.active=node1' -WindowStyle Hidden"
 
@@ -33,7 +39,7 @@ echo.
 echo All nodes started in background!
 
 echo.
-echo Dashboard: http://localhost:8081
+echo Dashboard: http://localhost:8080
 echo Node 1: http://localhost:8081/api/status
 echo Node 2: http://localhost:8082/api/status
 echo Node 3: http://localhost:8083/api/status
