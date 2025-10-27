@@ -13,6 +13,15 @@ import java.util.*;
  * Client-side controller that proxies requests to Raft nodes.
  * This controller is only active when running in client mode (raft.node.enabled=false).
  * It communicates with the Raft cluster nodes via REST API.
+ * 
+ * Endpoints:
+ * - GET  /api/status           - Get status from first available node
+ * - POST /api/command          - Submit command to cluster
+ * - GET  /api/nodes            - List all configured nodes
+ * - POST /api/nodes/{id}/*     - Node lifecycle operations
+ * - POST /api/cluster/*        - Cluster management operations
+ * - GET  /api/metrics/*        - Performance metrics (proxied to nodes)
+ * - POST /api/snapshot/*       - Snapshot operations (proxied to nodes)
  */
 @RestController
 @RequestMapping("/api")
@@ -127,14 +136,92 @@ public class ClientProxyController {
         return proxyToNodeManager("POST", "/cluster/remove-node", request);
     }
     
+    // ==================== Monitoring & Metrics Endpoints ====================
+    
     /**
-     * Helper method to proxy requests to any available node manager.
+     * Get status from any available node (used by dashboard).
      */
-    private ResponseEntity<Map<String, Object>> proxyToNodeManager(String method, String path, Object body) {
+    @GetMapping("/status")
+    public ResponseEntity<Map<String, Object>> getStatus() {
+        return proxyToAnyNode("GET", "/status", null);
+    }
+    
+    /**
+     * Get performance metrics from any available node.
+     */
+    @GetMapping("/metrics/performance")
+    public ResponseEntity<Map<String, Object>> getPerformanceMetrics() {
+        return proxyToAnyNode("GET", "/metrics/performance", null);
+    }
+    
+    /**
+     * Get health metrics from any available node.
+     */
+    @GetMapping("/metrics/health")
+    public ResponseEntity<Map<String, Object>> getHealthMetrics() {
+        return proxyToAnyNode("GET", "/metrics/health", null);
+    }
+    
+    /**
+     * Get replication metrics from any available node.
+     */
+    @GetMapping("/metrics/replication")
+    public ResponseEntity<Map<String, Object>> getReplicationMetrics() {
+        return proxyToAnyNode("GET", "/metrics/replication", null);
+    }
+    
+    /**
+     * Get event metrics from any available node.
+     */
+    @GetMapping("/metrics/events")
+    public ResponseEntity<Map<String, Object>> getEventMetrics(
+            @RequestParam(required = false) String type,
+            @RequestParam(required = false, defaultValue = "100") int limit) {
+        String path = String.format("/metrics/events?limit=%d", limit);
+        if (type != null && !type.isEmpty()) {
+            path += "&type=" + type;
+        }
+        return proxyToAnyNode("GET", path, null);
+    }
+    
+    /**
+     * Get snapshot statistics from any available node.
+     */
+    @GetMapping("/metrics/snapshots")
+    public ResponseEntity<Map<String, Object>> getSnapshotMetrics() {
+        return proxyToAnyNode("GET", "/metrics/snapshots", null);
+    }
+    
+    // ==================== Snapshot Endpoints ====================
+    
+    /**
+     * Create snapshot on a specific node.
+     */
+    @PostMapping("/snapshot/create")
+    public ResponseEntity<Map<String, Object>> createSnapshot() {
+        return proxyToAnyNode("POST", "/snapshot/create", null);
+    }
+    
+    /**
+     * Get snapshot info from any available node.
+     */
+    @GetMapping("/snapshot/info")
+    public ResponseEntity<Map<String, Object>> getSnapshotInfo() {
+        return proxyToAnyNode("GET", "/snapshot/info", null);
+    }
+    
+    // ==================== Helper Methods ====================
+    
+    /**
+     * Proxy request to any available node (tries all nodes until one succeeds).
+     * Used for read-only operations like metrics and status.
+     */
+    private ResponseEntity<Map<String, Object>> proxyToAnyNode(String method, String path, Object body) {
         for (int port : NODE_PORTS) {
             try {
                 String url = String.format("http://localhost:%d/api%s", port, path);
                 
+                @SuppressWarnings("rawtypes")
                 ResponseEntity<Map> response;
                 if ("POST".equals(method)) {
                     response = restTemplate.postForEntity(url, body != null ? body : "", Map.class);
@@ -143,7 +230,40 @@ public class ClientProxyController {
                 }
                 
                 if (response.getStatusCode().is2xxSuccessful()) {
-                    return ResponseEntity.ok(response.getBody());
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> result = response.getBody();
+                    return ResponseEntity.ok(result);
+                }
+            } catch (Exception e) {
+                log.debug("Failed to proxy to node on port {}: {}", port, e.getMessage());
+            }
+        }
+        
+        return ResponseEntity.status(503)
+            .body(Map.of("success", false, "message", "No available nodes found"));
+    }
+    
+    /**
+     * Helper method to proxy requests to any available node manager.
+     * Used for cluster management operations that need to succeed on at least one node.
+     */
+    private ResponseEntity<Map<String, Object>> proxyToNodeManager(String method, String path, Object body) {
+        for (int port : NODE_PORTS) {
+            try {
+                String url = String.format("http://localhost:%d/api%s", port, path);
+                
+                @SuppressWarnings("rawtypes")
+                ResponseEntity<Map> response;
+                if ("POST".equals(method)) {
+                    response = restTemplate.postForEntity(url, body != null ? body : "", Map.class);
+                } else {
+                    response = restTemplate.getForEntity(url, Map.class);
+                }
+                
+                if (response.getStatusCode().is2xxSuccessful()) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> result = response.getBody();
+                    return ResponseEntity.ok(result);
                 }
             } catch (Exception e) {
                 log.debug("Failed to proxy to node on port {}: {}", port, e.getMessage());
