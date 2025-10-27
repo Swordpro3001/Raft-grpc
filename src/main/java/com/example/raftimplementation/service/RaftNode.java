@@ -272,7 +272,7 @@ public class RaftNode {
 
         for (String peerId : stubs.keySet()) {
             nextIndex.put(peerId, raftLog.size());
-            matchIndex.put(peerId, 0);  // COUNT-based: 0 = no entries committed
+            matchIndex.put(peerId, 0);  // COUNT-based: 0 = follower has no entries replicated yet
         }
         
         if (heartbeatTask != null) {
