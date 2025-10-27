@@ -637,10 +637,152 @@ netstat -ano | findstr :8081
 - Check that peer host and port configuration is correct
 - Enable DEBUG logging for io.grpc to see connection attempts
 
+## Advanced Features
+
+### 1. Quorum Validation
+
+**Purpose**: Prevents the cluster from falling below the minimum size needed for fault tolerance (3 nodes minimum).
+
+**Behavior**:
+- Minimum cluster size enforced: 3 voting members
+- Fault tolerance: Can survive 1 node failure
+- Validation occurs before executing `removeServer()` operations
+- Prevents operator error from making the cluster non-fault-tolerant
+
+**Example**:
+```bash
+# Valid: Remove from 4-node cluster (3 remain)
+curl -X POST http://localhost:8081/api/cluster/remove/node4
+# Result: SUCCESS
+
+# Invalid: Remove from 3-node cluster (would become 2)
+curl -X POST http://localhost:8081/api/cluster/remove/node3
+# Result: REJECTED - Would violate minimum quorum
+```
+
+### 2. Staging Phase for New Nodes
+
+**Purpose**: Allows new nodes to catch up with the log before participating in elections, preventing split-brain scenarios and disrupted election outcomes.
+
+**Lifecycle**:
+1. **Add as Staging Server**: New node connects but cannot vote
+2. **Catch-Up Period**: Receives full log replication (typically 10 seconds)
+3. **Automatic Promotion**: When caught up, automatically promoted to voting member
+4. **Voting Member**: Joins cluster configuration (C_old,new → C_new)
+
+**Key Benefits**:
+- Staging servers excluded from election quorum calculations
+- Staging servers excluded from commit index quorum calculations
+- New servers don't disrupt leadership or consensus while catching up
+- Automatic promotion once ready (10s + within 5 log entries)
+
+**Usage**:
+```bash
+# Add node in staging mode (recommended)
+curl -X POST http://localhost:8081/api/cluster/add \
+  -H "Content-Type: application/json" \
+  -d '{"nodeId": "node4", "host": "localhost", "grpcPort": 9094, "httpPort": 8084, "staging": true}'
+
+# System behavior:
+# - node4 connects and replicates log (non-voting)
+# - Does NOT participate in elections
+# - After 10s + catching up → automatic promotion to voting member
+```
+
+**Staging Phase Details**:
+- Default staging duration: 10 seconds minimum
+- Catch-up threshold: Within 5 log entries of leader
+- Elections only count voting members (staging servers excluded)
+- Commit index calculated only from voting members
+
+### 3. Rollback for Failed Membership Changes
+
+**Purpose**: Automatically detect and revert membership changes that fail to commit within timeout period, ensuring cluster consistency.
+
+**Rollback Triggers**:
+- Configuration entry not committed within 30 seconds
+- Network partition prevents replication
+- Leader crash during membership change
+- Any failure in reaching quorum for configuration change
+
+**Automatic Rollback Process**:
+1. **Timeout Detection**: Membership change not committed within 30 seconds
+2. **Rollback**: Remove uncommitted log entries
+3. **Revert Configuration**: Restore previous cluster membership
+4. **Disconnect**: Close connections to removed servers
+5. **Log Event**: Record rollback for monitoring
+
+**Example Timeline**:
+```
+t=0s:   Leader adds C_old,new to log
+t=1s:   Network partition occurs
+t=30s:  TIMEOUT - Rollback triggered
+Result: 
+- Uncommitted entries removed
+- Connections to new server closed
+- Cluster reverts to previous configuration
+```
+
+**Monitoring Rollback Events**:
+```bash
+# Check logs for rollback events
+WARN: Membership change timed out after 30000ms - rolling back
+WARN: Rolling back membership change at index 42
+INFO: Disconnecting from server node4 (not in rollback config)
+INFO: Membership change rollback complete
+```
+
+### Configuration Parameters
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| MINIMUM_QUORUM | 3 nodes | Minimum voting members for fault tolerance |
+| STAGING_DURATION_MS | 10000ms | Minimum time before promotion eligibility |
+| STAGING_CATCHUP_THRESHOLD | 5 entries | Maximum log lag for promotion |
+| MEMBERSHIP_CHANGE_TIMEOUT_MS | 30000ms | Time before rollback triggered |
+
+### Integration: Adding Node with Full Safety
+
+This workflow demonstrates how all three features work together:
+
+```bash
+# 1. Start new node
+curl -X POST http://localhost:8081/api/nodes/node5/start
+
+# 2. Add in staging mode (validates quorum won't be violated)
+curl -X POST http://localhost:8081/api/cluster/add \
+  -H "Content-Type: application/json" \
+  -d '{
+    "nodeId": "node5",
+    "host": "localhost",
+    "grpcPort": 9095,
+    "httpPort": 8085,
+    "staging": true
+  }'
+
+# 3. System handles staging phase:
+#    - node5 connects and begins replication
+#    - Elections exclude node5 (staging servers not counted)
+#    - Commit index calculated without node5
+
+# 4. After 10s + catching up:
+#    - node5 automatically promoted to voting member
+#    - C_old,new configuration added to log
+#    - Rollback mechanism tracks for 30s timeout
+
+# 5. Membership change commits or rolls back:
+#    - SUCCESS: node5 becomes full voting member
+#    - TIMEOUT: Rollback to previous configuration, node5 disconnected
+```
+
 ## Implementation Status
 
 ### Completed
 
+- Quorum validation (prevents cluster size < 3)
+- Staging phase for new nodes (non-voting catch-up)
+- Automatic promotion from staging to voting
+- Rollback for failed membership changes
 - ClusterManager service for membership tracking
 - ServerInfo and ClusterConfiguration models
 - NodeManagerController for intelligent command routing
@@ -652,23 +794,20 @@ netstat -ano | findstr :8081
 
 ### Partially Implemented
 
-- Two-phase membership change (simplified single-phase)
-- Joint consensus majority calculation
-- Configuration change enforcement
+- ⚠️ Joint consensus majority calculation (simplified)
+- ⚠️ Configuration change enforcement (basic implementation)
 
 ### Future Work
 
-- Full two-phase C_old,new to C_new implementation
-- Joint consensus majority enforcement
-- Automatic C_new commit after C_old,new
-- Leader step-down on self-removal
-- New server catch-up before voting
-- Configuration in snapshots/log compaction
-- Bulk membership changes
-- Log persistence on disk
-- Snapshot and log compaction
-- Performance metrics
-- Prometheus/Grafana integration
+- [ ] Full two-phase C_old,new to C_new implementation with strict enforcement
+- [ ] Advanced joint consensus majority voting rules
+- [ ] Leader step-down on self-removal
+- [ ] Configuration in snapshots/log compaction
+- [ ] Bulk membership changes
+- [ ] Log persistence on disk
+- [ ] Snapshot and log compaction
+- [ ] Performance metrics and dashboards
+- [ ] Prometheus/Grafana integration
 
 ## References
 
