@@ -683,7 +683,7 @@ public class RaftNode {
             channels.put(serverInfo.getNodeId(), channel);
             stubs.put(serverInfo.getNodeId(), RaftServiceGrpc.newBlockingStub(channel));
             nextIndex.put(serverInfo.getNodeId(), raftLog.size());
-            matchIndex.put(serverInfo.getNodeId(), 0);  // COUNT-based: 0 = no entries committed
+            matchIndex.put(serverInfo.getNodeId(), 0);  // COUNT-based: 0 = new server has no entries replicated yet
             log.info("Connected to new server: {}", serverInfo);
         } catch (Exception e) {
             log.error("Failed to connect to new server: {}", serverInfo, e);
