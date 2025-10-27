@@ -1,14 +1,20 @@
 package com.example.raftimplementation.service;
 
 import com.example.raftimplementation.config.RaftConfig;
-import com.example.raftimplementation.grpc.*;
+import com.example.raftimplementation.grpc.AppendEntriesRequest;
+import com.example.raftimplementation.grpc.AppendEntriesResponse;
+import com.example.raftimplementation.grpc.GrpcLogEntry;
+import com.example.raftimplementation.grpc.VoteRequest;
+import com.example.raftimplementation.grpc.VoteResponse;
 import com.example.raftimplementation.model.LogEntry;
 import com.example.raftimplementation.model.NodeState;
 import com.example.raftimplementation.model.RaftEvent;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -117,8 +123,8 @@ class RaftNodeTest {
 
     @Test
     void testHandleAppendEntries() {
-        com.example.raftimplementation.grpc.LogEntry entry = 
-            com.example.raftimplementation.grpc.LogEntry.newBuilder()
+        GrpcLogEntry entry = 
+            GrpcLogEntry.newBuilder()
                 .setTerm(1)
                 .setCommand("SET x=1")
                 .build();
@@ -142,8 +148,8 @@ class RaftNodeTest {
     @Test
     void testHandleAppendEntriesWithCommit() {
         // Add entry
-        com.example.raftimplementation.grpc.LogEntry entry = 
-            com.example.raftimplementation.grpc.LogEntry.newBuilder()
+        GrpcLogEntry entry = 
+            GrpcLogEntry.newBuilder()
                 .setTerm(1)
                 .setCommand("FIRST_COMMAND")
                 .build();
@@ -264,8 +270,8 @@ class RaftNodeTest {
     void testMultipleLogEntries() {
         // Add multiple entries
         for (int i = 0; i < 5; i++) {
-            com.example.raftimplementation.grpc.LogEntry entry = 
-                com.example.raftimplementation.grpc.LogEntry.newBuilder()
+            GrpcLogEntry entry = 
+                GrpcLogEntry.newBuilder()
                     .setTerm(1)
                     .setCommand("CMD_" + i)
                     .build();
@@ -292,8 +298,8 @@ class RaftNodeTest {
     @Test
     void testCommitIndexNeverDecreases() {
         // Add and commit some entries
-        com.example.raftimplementation.grpc.LogEntry entry = 
-            com.example.raftimplementation.grpc.LogEntry.newBuilder()
+        GrpcLogEntry entry = 
+            GrpcLogEntry.newBuilder()
                 .setTerm(1)
                 .setCommand("CMD")
                 .build();
@@ -322,8 +328,8 @@ class RaftNodeTest {
         assertTrue(raftNode.getLastApplied().get() <= raftNode.getCommitIndex().get());
         
         // Add and commit entry
-        com.example.raftimplementation.grpc.LogEntry entry = 
-            com.example.raftimplementation.grpc.LogEntry.newBuilder()
+        GrpcLogEntry entry = 
+            GrpcLogEntry.newBuilder()
                 .setTerm(1)
                 .setCommand("CMD")
                 .build();
@@ -361,8 +367,8 @@ class RaftNodeTest {
 
     @Test
     void testLogEntryStructure() {
-        com.example.raftimplementation.grpc.LogEntry entry = 
-            com.example.raftimplementation.grpc.LogEntry.newBuilder()
+        GrpcLogEntry entry = 
+            GrpcLogEntry.newBuilder()
                 .setTerm(3)
                 .setCommand("TEST_COMMAND")
                 .build();

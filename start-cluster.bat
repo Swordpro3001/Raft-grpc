@@ -15,22 +15,14 @@ echo Starting Nodes silently in background...
 rem === Node 1 ===
 powershell -WindowStyle Hidden -Command "Start-Process 'cmd.exe' -ArgumentList '/c gradlew.bat bootRun --args=--spring.profiles.active=node1' -WindowStyle Hidden"
 
-timeout /t 3 /nobreak >nul
-
 rem === Node 2 ===
 powershell -WindowStyle Hidden -Command "Start-Process 'cmd.exe' -ArgumentList '/c gradlew.bat bootRun --args=--spring.profiles.active=node2' -WindowStyle Hidden"
-
-timeout /t 3 /nobreak >nul
 
 rem === Node 3 ===
 powershell -WindowStyle Hidden -Command "Start-Process 'cmd.exe' -ArgumentList '/c gradlew.bat bootRun --args=--spring.profiles.active=node3' -WindowStyle Hidden"
 
-timeout /t 3 /nobreak >nul
-
 rem === Node 4 ===
 powershell -WindowStyle Hidden -Command "Start-Process 'cmd.exe' -ArgumentList '/c gradlew.bat bootRun --args=--spring.profiles.active=node4' -WindowStyle Hidden"
-
-timeout /t 3 /nobreak >nul
 
 rem === Node 5 ===
 powershell -WindowStyle Hidden -Command "Start-Process 'cmd.exe' -ArgumentList '/c gradlew.bat bootRun --args=--spring.profiles.active=node5' -WindowStyle Hidden"

@@ -23,7 +23,7 @@ message VoteResponse {
   bool voteGranted = 2;
 }
 
-message LogEntry {
+message GrpcLogEntry {
   int32 term = 1;
   string command = 2;
   // Configuration change entry
@@ -48,7 +48,7 @@ message AppendEntriesRequest {
   string leaderId = 2;
   int32 prevLogIndex = 3;
   int32 prevLogTerm = 4;
-  repeated LogEntry entries = 5;
+  repeated GrpcLogEntry entries = 5;
   int32 leaderCommit = 6;
 }
 
