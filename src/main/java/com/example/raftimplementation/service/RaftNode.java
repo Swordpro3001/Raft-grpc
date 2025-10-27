@@ -761,9 +761,20 @@ public class RaftNode {
         status.put("currentTerm", currentTerm.get());
         status.put("currentLeader", currentLeader);
         status.put("commitIndex", commitIndex.get());
+        status.put("lastApplied", lastApplied.get());
         status.put("logSize", raftLog.size());
         status.put("stateMachine", new ArrayList<>(stateMachine));
         status.put("suspended", suspended);
+        
+        // Add snapshot information for correct state machine indexing
+        if (lastSnapshot != null) {
+            status.put("snapshotBaseIndex", lastSnapshot.getLastIncludedIndex());
+            status.put("hasSnapshot", true);
+        } else {
+            status.put("snapshotBaseIndex", 0);
+            status.put("hasSnapshot", false);
+        }
+        
         return status;
     }
     
