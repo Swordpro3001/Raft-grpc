@@ -321,10 +321,7 @@ public class RaftNode {
             List<GrpcLogEntry> entries = new ArrayList<>();
             for (int i = peerNextIndex; i < raftLog.size(); i++) {
                 LogEntry entry1 = raftLog.get(i);
-                entries.add(GrpcLogEntry.newBuilder()
-                    .setTerm(entry1.getTerm())
-                    .setCommand(entry1.getCommand())
-                    .build());
+                entries.add(convertToGrpcLogEntry(entry1));
             }
             
             AppendEntriesRequest request = AppendEntriesRequest.newBuilder()
@@ -422,21 +419,36 @@ public class RaftNode {
         if (config.isJoint()) {
             // C_old,new has been committed
             // Now add C_new configuration entry (only leader does this)
+            // BUT: Only if we haven't already added it!
             if (state == NodeState.LEADER) {
-                Set<String> newServers = config.getNewServers();
+                // Check if C_new already exists in the log after this entry
+                boolean cNewExists = false;
+                for (int i = index + 1; i < raftLog.size(); i++) {
+                    LogEntry nextEntry = raftLog.get(i);
+                    if (nextEntry.isConfigurationEntry() && !nextEntry.getConfiguration().isJoint()) {
+                        cNewExists = true;
+                        break;
+                    }
+                }
                 
-                ClusterConfiguration newConfig =
-                    ClusterConfiguration.createNew(newServers);
-                
-                LogEntry newConfigEntry =
-                    new LogEntry(currentTerm.get(), null, newConfig);
-                
-                raftLog.add(newConfigEntry);
-                
-                logEvent(RaftEvent.EventType.MEMBERSHIP_CHANGE_COMMITTED, 
-                    "C_old,new committed. Added C_new configuration to log");
-                
-                sendHeartbeats();
+                if (!cNewExists) {
+                    Set<String> newServers = config.getNewServers();
+                    
+                    ClusterConfiguration newConfig =
+                        ClusterConfiguration.createNew(newServers);
+                    
+                    LogEntry newConfigEntry =
+                        new LogEntry(currentTerm.get(), null, newConfig);
+                    
+                    raftLog.add(newConfigEntry);
+                    
+                    logEvent(RaftEvent.EventType.MEMBERSHIP_CHANGE_COMMITTED, 
+                        "C_old,new committed. Added C_new configuration to log");
+                    
+                    sendHeartbeats();
+                } else {
+                    log.debug("C_new already exists in log, skipping duplicate creation");
+                }
             }
         } else {
             // C_new has been committed
@@ -579,7 +591,9 @@ public class RaftNode {
             }
             
             if (newEntryIndex >= raftLog.size()) {
-                raftLog.add(new LogEntry(entry.getTerm(), entry.getCommand()));
+                // Convert gRPC entry back to internal LogEntry
+                LogEntry logEntry = convertFromGrpcLogEntry(entry);
+                raftLog.add(logEntry);
                 entriesAdded++;
             }
             newEntryIndex++;
@@ -743,4 +757,101 @@ public class RaftNode {
         status.put("suspended", suspended);
         return status;
     }
+    
+    /**
+     * Convert internal LogEntry to gRPC LogEntry for network transmission.
+     */
+    private GrpcLogEntry convertToGrpcLogEntry(LogEntry entry) {
+        GrpcLogEntry.Builder builder = GrpcLogEntry.newBuilder()
+            .setTerm(entry.getTerm());
+        
+        // Set command if present
+        if (entry.getCommand() != null) {
+            builder.setCommand(entry.getCommand());
+        }
+        
+        // Set configuration if this is a configuration entry
+        if (entry.isConfigurationEntry() && entry.getConfiguration() != null) {
+            builder.setConfiguration(convertToGrpcConfiguration(entry.getConfiguration()));
+        }
+        
+        return builder.build();
+    }
+    
+    /**
+     * Convert gRPC LogEntry back to internal LogEntry.
+     */
+    private LogEntry convertFromGrpcLogEntry(GrpcLogEntry grpcEntry) {
+        // Check if this is a configuration entry
+        if (grpcEntry.hasConfiguration()) {
+            ClusterConfiguration config = convertFromGrpcConfiguration(grpcEntry.getConfiguration());
+            return new LogEntry(grpcEntry.getTerm(), null, config);
+        } else {
+            // Regular command entry
+            String command = grpcEntry.getCommand();
+            if (command != null && command.isEmpty()) {
+                command = null; // Treat empty string as null
+            }
+            return new LogEntry(grpcEntry.getTerm(), command);
+        }
+    }
+    
+    /**
+     * Convert ClusterConfiguration to gRPC ConfigurationEntry.
+     */
+    private com.example.raftimplementation.grpc.ConfigurationEntry convertToGrpcConfiguration(
+            ClusterConfiguration config) {
+        com.example.raftimplementation.grpc.ConfigurationEntry.Builder builder = 
+            com.example.raftimplementation.grpc.ConfigurationEntry.newBuilder()
+                .setIsJoint(config.isJoint());
+        
+        // Add old servers - just nodeIds since we don't have full ServerInfo
+        for (String nodeId : config.getOldServers()) {
+            builder.addOldServers(
+                com.example.raftimplementation.grpc.ServerEntry.newBuilder()
+                    .setNodeId(nodeId)
+                    .setHost("") // Unknown in this context
+                    .setGrpcPort(0)
+                    .setHttpPort(0)
+                    .build()
+            );
+        }
+        
+        // Add new servers
+        for (String nodeId : config.getNewServers()) {
+            builder.addNewServers(
+                com.example.raftimplementation.grpc.ServerEntry.newBuilder()
+                    .setNodeId(nodeId)
+                    .setHost("") // Unknown in this context
+                    .setGrpcPort(0)
+                    .setHttpPort(0)
+                    .build()
+            );
+        }
+        
+        return builder.build();
+    }
+    
+    /**
+     * Convert gRPC ConfigurationEntry back to ClusterConfiguration.
+     */
+    private ClusterConfiguration convertFromGrpcConfiguration(
+            com.example.raftimplementation.grpc.ConfigurationEntry grpcConfig) {
+        Set<String> oldServers = new HashSet<>();
+        for (com.example.raftimplementation.grpc.ServerEntry server : grpcConfig.getOldServersList()) {
+            oldServers.add(server.getNodeId());
+        }
+        
+        Set<String> newServers = new HashSet<>();
+        for (com.example.raftimplementation.grpc.ServerEntry server : grpcConfig.getNewServersList()) {
+            newServers.add(server.getNodeId());
+        }
+        
+        if (grpcConfig.getIsJoint()) {
+            return ClusterConfiguration.createJoint(oldServers, newServers);
+        } else {
+            return ClusterConfiguration.createNew(newServers);
+        }
+    }
 }
+

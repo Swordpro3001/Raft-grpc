@@ -467,12 +467,19 @@
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
                 <div>
                     <h3 style="color: #667eea; margin-bottom: 10px;">Add Node to Cluster</h3>
+                    <div style="background: #fff3cd; padding: 12px; border-radius: 8px; margin-bottom: 10px; border-left: 4px solid #ffc107;">
+                        <strong>Wichtig:</strong> Nach dem Hinzufügen muss der Node <strong>manuell gestartet</strong> werden!<br>
+                        <small>Siehe <code>README.md</code> für Details.</small>
+                    </div>
                     <div style="display: flex; flex-direction: column; gap: 8px;">
                         <input type="text" id="newNodeId" placeholder="Node ID (z.B. node6)">
                         <input type="text" id="newNodeHost" placeholder="Host (z.B. localhost)" value="localhost">
                         <input type="text" id="newNodeGrpcPort" placeholder="gRPC Port (z.B. 50056)">
                         <input type="text" id="newNodeHttpPort" placeholder="HTTP Port (z.B. 8086)">
-                        <button onclick="addNode()">➕ Add Node</button>
+                        <button onclick="addNode()">+ Add Node</button>
+                        <small style="color: #666; font-size: 12px;">
+                            Kommando zum Starten: <code>.\start-node.bat [nodeId] [httpPort] [grpcPort]</code>
+                        </small>
                     </div>
                 </div>
                 <div>
@@ -774,7 +781,13 @@
                 const data = await response.json();
                 
                 if (data.success) {
-                    showClusterMessage(`✓ ${nodeId} wurde zum Cluster hinzugefügt`, 'success');
+                    showClusterMessage(
+                        `✓ ${nodeId} wurde zum Cluster hinzugefügt!\n\n` +
+                        `⚠️ WICHTIG: Starte den Node jetzt manuell:\n` +
+                        `.\\start-node.bat ${nodeId} ${httpPort} ${grpcPort}\n\n` +
+                        `Oder: .\\gradlew.bat bootRun --args=--spring.profiles.active=${nodeId}`,
+                        'success'
+                    );
                     // Clear form
                     document.getElementById('newNodeId').value = '';
                     document.getElementById('newNodeGrpcPort').value = '';
@@ -839,13 +852,14 @@
         
         function showClusterMessage(text, type) {
             const message = document.getElementById('clusterMessage');
+            message.style.whiteSpace = 'pre-wrap'; // Preserve line breaks
             message.textContent = text;
             message.className = `message ${type}`;
             message.style.display = 'block';
             
             setTimeout(() => {
                 message.style.display = 'none';
-            }, 5000);
+            }, 15000); // Show longer for important instructions
         }
         
         function hasStateChanged(nodeId, newStatus) {
