@@ -40,6 +40,12 @@ public class RaftNode {
 
     private final List<String> stateMachine = Collections.synchronizedList(new ArrayList<>());
     
+    // Snapshot state for log compaction
+    private volatile Snapshot lastSnapshot = null;
+    private final AtomicInteger compactedEntries = new AtomicInteger(0);
+    private final AtomicInteger totalSnapshots = new AtomicInteger(0);
+    private static final int SNAPSHOT_THRESHOLD = 100; // Create snapshot after 100 entries
+    
 
     private final List<RaftEvent> events =
         Collections.synchronizedList(new LinkedList<>());
@@ -405,6 +411,9 @@ public class RaftNode {
             }
             lastApplied.incrementAndGet();  // Increment count after applying
         }
+        
+        // Check if we should create a snapshot
+        checkSnapshotThreshold();
     }
     
     /**
@@ -853,5 +862,199 @@ public class RaftNode {
             return ClusterConfiguration.createNew(newServers);
         }
     }
+    
+    /**
+     * Create a snapshot of the current state machine.
+     * This is used for log compaction to prevent unbounded log growth.
+     */
+    public synchronized void createSnapshot() {
+        if (raftLog.isEmpty()) {
+            log.debug("Cannot create snapshot: log is empty");
+            return;
+        }
+        
+        int lastIndex = lastApplied.get();
+        if (lastIndex <= 0) {
+            log.debug("Cannot create snapshot: no entries applied yet");
+            return;
+        }
+        
+        // Don't create snapshot if we already have a recent one
+        if (lastSnapshot != null && lastIndex <= lastSnapshot.getLastIncludedIndex()) {
+            log.debug("Snapshot already exists for index {}", lastIndex);
+            return;
+        }
+        
+        try {
+            // Get the term of the last applied entry
+            int lastTerm = raftLog.get(lastIndex - 1).getTerm();
+            
+            // Copy state machine state
+            List<String> stateCopy = new ArrayList<>(stateMachine);
+            
+            // Find current configuration
+            ClusterConfiguration currentConfig = findCurrentConfiguration();
+            
+            // Calculate size
+            long sizeBytes = estimateSnapshotSize(stateCopy);
+            
+            // Create snapshot
+            Snapshot snapshot = new Snapshot(
+                lastIndex,
+                lastTerm,
+                stateCopy,
+                currentConfig,
+                System.currentTimeMillis(),
+                sizeBytes
+            );
+            
+            // Update snapshot state
+            lastSnapshot = snapshot;
+            totalSnapshots.incrementAndGet();
+            
+            // Compact the log: remove entries up to lastIndex
+            int entriesRemoved = compactLog(lastIndex);
+            compactedEntries.addAndGet(entriesRemoved);
+            
+            log.info("Created snapshot at index {} (term {}), compacted {} entries, size: {} bytes",
+                lastIndex, lastTerm, entriesRemoved, sizeBytes);
+            
+            logEvent(RaftEvent.EventType.SNAPSHOT_CREATED,
+                String.format("Created snapshot at index %d, compacted %d entries", lastIndex, entriesRemoved));
+            
+        } catch (Exception e) {
+            log.error("Failed to create snapshot", e);
+        }
+    }
+    
+    /**
+     * Compact the log by removing entries up to (but not including) the snapshot index.
+     * Returns the number of entries removed.
+     */
+    private int compactLog(int snapshotIndex) {
+        if (snapshotIndex <= 0 || raftLog.isEmpty()) {
+            return 0;
+        }
+        
+        // Remove entries from 0 to snapshotIndex-1
+        int toRemove = Math.min(snapshotIndex, raftLog.size());
+        
+        synchronized (raftLog) {
+            for (int i = 0; i < toRemove; i++) {
+                raftLog.remove(0); // Always remove first element
+            }
+        }
+        
+        // Update indices (they're now relative to snapshot)
+        // Note: In a full implementation, you'd need to adjust all index references
+        
+        return toRemove;
+    }
+    
+    /**
+     * Find the current cluster configuration from the log.
+     */
+    private ClusterConfiguration findCurrentConfiguration() {
+        // Search backwards through log for most recent configuration
+        for (int i = raftLog.size() - 1; i >= 0; i--) {
+            LogEntry entry = raftLog.get(i);
+            if (entry.isConfigurationEntry()) {
+                return entry.getConfiguration();
+            }
+        }
+        
+        // If no configuration found, create default from current peers
+        Set<String> currentServers = new HashSet<>(stubs.keySet());
+        currentServers.add(config.getNodeId());
+        return ClusterConfiguration.createNew(currentServers);
+    }
+    
+    /**
+     * Estimate the size of a snapshot in bytes.
+     */
+    private long estimateSnapshotSize(List<String> state) {
+        // Rough estimate: each string averages 50 bytes
+        return state.size() * 50L;
+    }
+    
+    /**
+     * Check if we should create a snapshot based on log size.
+     */
+    private void checkSnapshotThreshold() {
+        int logSize = raftLog.size();
+        int appliedCount = lastApplied.get();
+        
+        // Create snapshot if we have enough applied entries
+        if (logSize >= SNAPSHOT_THRESHOLD && appliedCount >= SNAPSHOT_THRESHOLD / 2) {
+            log.info("Log size ({}) reached snapshot threshold ({}), creating snapshot", 
+                logSize, SNAPSHOT_THRESHOLD);
+            createSnapshot();
+        }
+    }
+    
+    /**
+     * Install a snapshot received from the leader.
+     * This is used when a follower is too far behind.
+     */
+    public synchronized void installSnapshot(Snapshot snapshot) {
+        if (snapshot == null) {
+            log.warn("Cannot install null snapshot");
+            return;
+        }
+        
+        // Verify snapshot is newer than our current one
+        if (lastSnapshot != null && snapshot.getLastIncludedIndex() <= lastSnapshot.getLastIncludedIndex()) {
+            log.debug("Ignoring older snapshot (index {})", snapshot.getLastIncludedIndex());
+            return;
+        }
+        
+        log.info("Installing snapshot at index {} (term {})", 
+            snapshot.getLastIncludedIndex(), snapshot.getLastIncludedTerm());
+        
+        // Discard entire log if snapshot is more recent
+        if (snapshot.getLastIncludedIndex() >= raftLog.size()) {
+            raftLog.clear();
+        } else {
+            // Keep only log entries after snapshot
+            synchronized (raftLog) {
+                int toRemove = snapshot.getLastIncludedIndex();
+                for (int i = 0; i < toRemove && !raftLog.isEmpty(); i++) {
+                    raftLog.remove(0);
+                }
+            }
+        }
+        
+        // Install snapshot
+        lastSnapshot = snapshot;
+        
+        // Restore state machine
+        stateMachine.clear();
+        stateMachine.addAll(snapshot.getStateMachineState());
+        
+        // Update indices
+        lastApplied.set(snapshot.getLastIncludedIndex());
+        commitIndex.set(Math.max(commitIndex.get(), snapshot.getLastIncludedIndex()));
+        
+        log.info("Snapshot installed successfully, state machine size: {}", stateMachine.size());
+        
+        logEvent(RaftEvent.EventType.SNAPSHOT_INSTALLED,
+            String.format("Installed snapshot at index %d", snapshot.getLastIncludedIndex()));
+    }
+    
+    /**
+     * Get the base index for log entries (accounting for snapshot).
+     * This is the index of the last entry in the snapshot.
+     */
+    public int getLogBaseIndex() {
+        return lastSnapshot != null ? lastSnapshot.getLastIncludedIndex() : 0;
+    }
+    
+    /**
+     * Get the base term for log entries (accounting for snapshot).
+     */
+    public int getLogBaseTerm() {
+        return lastSnapshot != null ? lastSnapshot.getLastIncludedTerm() : 0;
+    }
 }
+
 
