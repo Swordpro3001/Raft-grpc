@@ -31,7 +31,9 @@ public class RaftEvent {
         MEMBERSHIP_CHANGE_START,
         MEMBERSHIP_CHANGE_COMMITTED,
         SERVER_ADDED,
-        SERVER_REMOVED
+        SERVER_REMOVED,
+        SNAPSHOT_CREATED,
+        SNAPSHOT_INSTALLED
     }
     
     public String getFormattedTimestamp() {

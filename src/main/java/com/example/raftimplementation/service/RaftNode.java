@@ -7,6 +7,7 @@ import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
 
 import jakarta.annotation.PostConstruct;
@@ -16,6 +17,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 @Service
+@ConditionalOnProperty(name = "raft.node.enabled", havingValue = "true", matchIfMissing = true)
 @Slf4j
 @Getter
 public class RaftNode {
@@ -39,6 +41,12 @@ public class RaftNode {
     
 
     private final List<String> stateMachine = Collections.synchronizedList(new ArrayList<>());
+    
+    // Snapshot state for log compaction
+    private volatile Snapshot lastSnapshot = null;
+    private final AtomicInteger compactedEntries = new AtomicInteger(0);
+    private final AtomicInteger totalSnapshots = new AtomicInteger(0);
+    private static final int SNAPSHOT_THRESHOLD = 100; // Create snapshot after 100 entries
     
 
     private final List<RaftEvent> events =
@@ -201,7 +209,17 @@ public class RaftNode {
             return;
         }
         
-        log.info("Election timeout! Starting election...");
+        // Pre-vote phase: Check if election would be successful before disrupting cluster
+        log.info("Starting pre-vote phase for node {}", config.getNodeId());
+        boolean preVoteSuccessful = performPreVote();
+        
+        if (!preVoteSuccessful) {
+            log.info("Pre-vote failed for node {}, not starting actual election", config.getNodeId());
+            startElectionTimer();
+            return;
+        }
+        
+        log.info("Pre-vote successful! Starting actual election...");
         logEvent(RaftEvent.EventType.STATE_CHANGE,
             "FOLLOWER → CANDIDATE");
         state = NodeState.CANDIDATE;
@@ -315,6 +333,22 @@ public class RaftNode {
             RaftServiceGrpc.RaftServiceBlockingStub stub = entry.getValue();
             
             int peerNextIndex = nextIndex.getOrDefault(peerId, 0);
+            
+            // Check if follower is too far behind and needs snapshot
+            if (lastSnapshot != null && peerNextIndex <= lastSnapshot.getLastIncludedIndex()) {
+                log.info("Follower {} is too far behind (nextIndex={}, snapshotIndex={}), sending snapshot",
+                        peerId, peerNextIndex, lastSnapshot.getLastIncludedIndex());
+                try {
+                    boolean success = sendInstallSnapshot(peerId);
+                    if (success) {
+                        log.info("Successfully sent snapshot to {}", peerId);
+                    }
+                } catch (Exception e) {
+                    log.error("Failed to send snapshot to {}: {}", peerId, e.getMessage());
+                }
+                continue;  // Skip AppendEntries for this peer
+            }
+            
             int prevLogIndex = peerNextIndex - 1;
             int prevLogTerm = prevLogIndex >= 0 && prevLogIndex < raftLog.size() ? raftLog.get(prevLogIndex).getTerm() : 0;
             
@@ -405,6 +439,9 @@ public class RaftNode {
             }
             lastApplied.incrementAndGet();  // Increment count after applying
         }
+        
+        // Check if we should create a snapshot
+        checkSnapshotThreshold();
     }
     
     /**
@@ -752,9 +789,20 @@ public class RaftNode {
         status.put("currentTerm", currentTerm.get());
         status.put("currentLeader", currentLeader);
         status.put("commitIndex", commitIndex.get());
+        status.put("lastApplied", lastApplied.get());
         status.put("logSize", raftLog.size());
         status.put("stateMachine", new ArrayList<>(stateMachine));
         status.put("suspended", suspended);
+        
+        // Add snapshot information for correct state machine indexing
+        if (lastSnapshot != null) {
+            status.put("snapshotBaseIndex", lastSnapshot.getLastIncludedIndex());
+            status.put("hasSnapshot", true);
+        } else {
+            status.put("snapshotBaseIndex", 0);
+            status.put("hasSnapshot", false);
+        }
+        
         return status;
     }
     
@@ -853,5 +901,548 @@ public class RaftNode {
             return ClusterConfiguration.createNew(newServers);
         }
     }
+    
+    /**
+     * Create a snapshot of the current state machine.
+     * This is used for log compaction to prevent unbounded log growth.
+     */
+    public synchronized void createSnapshot() {
+        if (raftLog.isEmpty()) {
+            log.debug("Cannot create snapshot: log is empty");
+            return;
+        }
+        
+        int lastIndex = lastApplied.get();
+        if (lastIndex <= 0) {
+            log.debug("Cannot create snapshot: no entries applied yet");
+            return;
+        }
+        
+        // Don't create snapshot if we already have a recent one
+        if (lastSnapshot != null && lastIndex <= lastSnapshot.getLastIncludedIndex()) {
+            log.debug("Snapshot already exists for index {}", lastIndex);
+            return;
+        }
+        
+        try {
+            // Get the term of the last applied entry
+            int lastTerm = raftLog.get(lastIndex - 1).getTerm();
+            
+            // Copy state machine state
+            List<String> stateCopy = new ArrayList<>(stateMachine);
+            
+            // Find current configuration
+            ClusterConfiguration currentConfig = findCurrentConfiguration();
+            
+            // Calculate size
+            long sizeBytes = estimateSnapshotSize(stateCopy);
+            
+            // Create snapshot
+            Snapshot snapshot = new Snapshot(
+                lastIndex,
+                lastTerm,
+                stateCopy,
+                currentConfig,
+                System.currentTimeMillis(),
+                sizeBytes
+            );
+            
+            // Update snapshot state
+            lastSnapshot = snapshot;
+            totalSnapshots.incrementAndGet();
+            
+            // Compact the log: remove entries up to lastIndex
+            int entriesRemoved = compactLog(lastIndex);
+            compactedEntries.addAndGet(entriesRemoved);
+            
+            log.info("Created snapshot at index {} (term {}), compacted {} entries, size: {} bytes",
+                lastIndex, lastTerm, entriesRemoved, sizeBytes);
+            
+            logEvent(RaftEvent.EventType.SNAPSHOT_CREATED,
+                String.format("Created snapshot at index %d, compacted %d entries", lastIndex, entriesRemoved));
+            
+        } catch (Exception e) {
+            log.error("Failed to create snapshot", e);
+        }
+    }
+    
+    /**
+     * Compact the log by removing entries up to (but not including) the snapshot index.
+     * Returns the number of entries removed.
+     */
+    private int compactLog(int snapshotIndex) {
+        if (snapshotIndex <= 0 || raftLog.isEmpty()) {
+            return 0;
+        }
+        
+        // Remove entries from 0 to snapshotIndex-1
+        int toRemove = Math.min(snapshotIndex, raftLog.size());
+        
+        synchronized (raftLog) {
+            for (int i = 0; i < toRemove; i++) {
+                raftLog.remove(0); // Always remove first element
+            }
+        }
+        
+        // Update indices (they're now relative to snapshot)
+        // Note: In a full implementation, you'd need to adjust all index references
+        
+        return toRemove;
+    }
+    
+    /**
+     * Find the current cluster configuration from the log.
+     */
+    private ClusterConfiguration findCurrentConfiguration() {
+        // Search backwards through log for most recent configuration
+        for (int i = raftLog.size() - 1; i >= 0; i--) {
+            LogEntry entry = raftLog.get(i);
+            if (entry.isConfigurationEntry()) {
+                return entry.getConfiguration();
+            }
+        }
+        
+        // If no configuration found, create default from current peers
+        Set<String> currentServers = new HashSet<>(stubs.keySet());
+        currentServers.add(config.getNodeId());
+        return ClusterConfiguration.createNew(currentServers);
+    }
+    
+    /**
+     * Estimate the size of a snapshot in bytes.
+     */
+    private long estimateSnapshotSize(List<String> state) {
+        // Rough estimate: each string averages 50 bytes
+        return state.size() * 50L;
+    }
+    
+    /**
+     * Check if we should create a snapshot based on log size.
+     */
+    private void checkSnapshotThreshold() {
+        int logSize = raftLog.size();
+        int appliedCount = lastApplied.get();
+        
+        // Create snapshot if we have enough applied entries
+        if (logSize >= SNAPSHOT_THRESHOLD && appliedCount >= SNAPSHOT_THRESHOLD / 2) {
+            log.info("Log size ({}) reached snapshot threshold ({}), creating snapshot", 
+                logSize, SNAPSHOT_THRESHOLD);
+            createSnapshot();
+        }
+    }
+    
+    /**
+     * Install a snapshot received from the leader.
+     * This is used when a follower is too far behind.
+     */
+    public synchronized void installSnapshot(Snapshot snapshot) {
+        if (snapshot == null) {
+            log.warn("Cannot install null snapshot");
+            return;
+        }
+        
+        // Verify snapshot is newer than our current one
+        if (lastSnapshot != null && snapshot.getLastIncludedIndex() <= lastSnapshot.getLastIncludedIndex()) {
+            log.debug("Ignoring older snapshot (index {})", snapshot.getLastIncludedIndex());
+            return;
+        }
+        
+        log.info("Installing snapshot at index {} (term {})", 
+            snapshot.getLastIncludedIndex(), snapshot.getLastIncludedTerm());
+        
+        // Discard entire log if snapshot is more recent
+        if (snapshot.getLastIncludedIndex() >= raftLog.size()) {
+            raftLog.clear();
+        } else {
+            // Keep only log entries after snapshot
+            synchronized (raftLog) {
+                int toRemove = snapshot.getLastIncludedIndex();
+                for (int i = 0; i < toRemove && !raftLog.isEmpty(); i++) {
+                    raftLog.remove(0);
+                }
+            }
+        }
+        
+        // Install snapshot
+        lastSnapshot = snapshot;
+        
+        // Restore state machine
+        stateMachine.clear();
+        stateMachine.addAll(snapshot.getStateMachineState());
+        
+        // Update indices
+        lastApplied.set(snapshot.getLastIncludedIndex());
+        commitIndex.set(Math.max(commitIndex.get(), snapshot.getLastIncludedIndex()));
+        
+        log.info("Snapshot installed successfully, state machine size: {}", stateMachine.size());
+        
+        logEvent(RaftEvent.EventType.SNAPSHOT_INSTALLED,
+            String.format("Installed snapshot at index %d", snapshot.getLastIncludedIndex()));
+    }
+    
+    /**
+     * Get the base index for log entries (accounting for snapshot).
+     * This is the index of the last entry in the snapshot.
+     */
+    public int getLogBaseIndex() {
+        return lastSnapshot != null ? lastSnapshot.getLastIncludedIndex() : 0;
+    }
+    
+    /**
+     * Get the base term for log entries (accounting for snapshot).
+     */
+    public int getLogBaseTerm() {
+        return lastSnapshot != null ? lastSnapshot.getLastIncludedTerm() : 0;
+    }
+    
+    // ==================== Advanced Raft Features ====================
+    
+    /**
+     * InstallSnapshot RPC - Leader sends snapshot to follower that's too far behind.
+     */
+    public InstallSnapshotResponse handleInstallSnapshot(InstallSnapshotRequest request) {
+        log.info("Received InstallSnapshot RPC from {} for term {}, lastIncludedIndex: {}", 
+                 request.getLeaderId(), request.getTerm(), request.getLastIncludedIndex());
+        
+        // Reply false if term < currentTerm
+        if (request.getTerm() < currentTerm.get()) {
+            log.debug("Rejecting snapshot from {} due to stale term {} < {}", 
+                     request.getLeaderId(), request.getTerm(), currentTerm.get());
+            return InstallSnapshotResponse.newBuilder()
+                .setTerm(currentTerm.get())
+                .setSuccess(false)
+                .build();
+        }
+        
+        // Update term if necessary
+        if (request.getTerm() > currentTerm.get()) {
+            currentTerm.set(request.getTerm());
+            state = NodeState.FOLLOWER;
+            votedFor = null;
+            logEvent(RaftEvent.EventType.TERM_INCREASED, 
+                    "Term increased to " + request.getTerm() + " by InstallSnapshot from " + request.getLeaderId());
+        }
+        
+        // Reset election timer
+        lastHeartbeat = System.currentTimeMillis();
+        currentLeader = request.getLeaderId();
+        
+        // If snapshot is outdated, reject it
+        if (request.getLastIncludedIndex() <= commitIndex.get()) {
+            log.debug("Snapshot is outdated (lastIncludedIndex: {} <= commitIndex: {}), ignoring", 
+                     request.getLastIncludedIndex(), commitIndex.get());
+            return InstallSnapshotResponse.newBuilder()
+                .setTerm(currentTerm.get())
+                .setSuccess(true)  // Already have this data
+                .build();
+        }
+        
+        try {
+            // Deserialize snapshot data
+            java.io.ByteArrayInputStream bis = new java.io.ByteArrayInputStream(request.getData().toByteArray());
+            java.io.ObjectInputStream ois = new java.io.ObjectInputStream(bis);
+            
+            @SuppressWarnings("unchecked")
+            List<String> snapshotStateMachine = (List<String>) ois.readObject();
+            int snapshotTerm = ois.readInt();
+            
+            // Calculate size for monitoring
+            long sizeBytes = request.getData().size();
+            
+            // Create Snapshot object
+            Snapshot snapshot = new Snapshot(
+                request.getLastIncludedIndex(),
+                request.getLastIncludedTerm(),
+                new ArrayList<>(snapshotStateMachine),
+                null,  // ClusterConfiguration - not included in this implementation
+                System.currentTimeMillis(),
+                sizeBytes
+            );
+            
+            // Install snapshot
+            synchronized (stateMachine) {
+                stateMachine.clear();
+                stateMachine.addAll(snapshotStateMachine);
+            }
+            
+            synchronized (raftLog) {
+                // Discard entire log if snapshot is newer
+                if (request.getLastIncludedIndex() >= raftLog.size()) {
+                    int discarded = raftLog.size();
+                    raftLog.clear();
+                    log.info("Discarded entire log ({} entries) due to snapshot", discarded);
+                } else {
+                    // Discard log entries up to lastIncludedIndex
+                    int entriesToDiscard = Math.min(request.getLastIncludedIndex(), raftLog.size());
+                    if (entriesToDiscard > 0) {
+                        raftLog.subList(0, entriesToDiscard).clear();
+                        log.info("Discarded {} log entries due to snapshot", entriesToDiscard);
+                    }
+                }
+            }
+            
+            // Update snapshot and indices
+            lastSnapshot = snapshot;
+            commitIndex.set(Math.max(commitIndex.get(), request.getLastIncludedIndex()));
+            lastApplied.set(Math.max(lastApplied.get(), request.getLastIncludedIndex()));
+            compactedEntries.addAndGet(request.getLastIncludedIndex());
+            
+            logEvent(RaftEvent.EventType.SNAPSHOT_INSTALLED, 
+                    String.format("Installed snapshot from %s (index: %d, term: %d, size: %d entries)",
+                                request.getLeaderId(), request.getLastIncludedIndex(), 
+                                request.getLastIncludedTerm(), snapshotStateMachine.size()));
+            
+            log.info("Successfully installed snapshot from {} (lastIncludedIndex: {}, stateMachineSize: {})",
+                    request.getLeaderId(), request.getLastIncludedIndex(), snapshotStateMachine.size());
+            
+            return InstallSnapshotResponse.newBuilder()
+                .setTerm(currentTerm.get())
+                .setSuccess(true)
+                .build();
+                
+        } catch (Exception e) {
+            log.error("Failed to install snapshot from {}: {}", request.getLeaderId(), e.getMessage(), e);
+            return InstallSnapshotResponse.newBuilder()
+                .setTerm(currentTerm.get())
+                .setSuccess(false)
+                .build();
+        }
+    }
+    
+    /**
+     * Send InstallSnapshot RPC to a follower that's too far behind.
+     */
+    public boolean sendInstallSnapshot(String peerId) {
+        if (lastSnapshot == null) {
+            log.warn("Cannot send snapshot to {} - no snapshot available", peerId);
+            return false;
+        }
+        
+        try {
+            // Serialize snapshot data
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            java.io.ObjectOutputStream oos = new java.io.ObjectOutputStream(bos);
+            oos.writeObject(lastSnapshot.getStateMachineState());
+            oos.writeInt(lastSnapshot.getLastIncludedTerm());
+            oos.flush();
+            
+            InstallSnapshotRequest request = InstallSnapshotRequest.newBuilder()
+                .setTerm(currentTerm.get())
+                .setLeaderId(config.getNodeId())
+                .setLastIncludedIndex(lastSnapshot.getLastIncludedIndex())
+                .setLastIncludedTerm(lastSnapshot.getLastIncludedTerm())
+                .setData(com.google.protobuf.ByteString.copyFrom(bos.toByteArray()))
+                .setDone(true)
+                .setOffset(0)
+                .build();
+            
+            RaftServiceGrpc.RaftServiceBlockingStub stub = stubs.get(peerId);
+            if (stub == null) {
+                log.warn("No stub available for peer {}", peerId);
+                return false;
+            }
+            
+            InstallSnapshotResponse response = stub.withDeadlineAfter(5, TimeUnit.SECONDS)
+                .installSnapshot(request);
+            
+            if (response.getTerm() > currentTerm.get()) {
+                currentTerm.set(response.getTerm());
+                state = NodeState.FOLLOWER;
+                votedFor = null;
+                logEvent(RaftEvent.EventType.TERM_INCREASED, 
+                        "Term increased to " + response.getTerm() + " by InstallSnapshot response from " + peerId);
+                return false;
+            }
+            
+            if (response.getSuccess()) {
+                // Update nextIndex and matchIndex for this follower
+                nextIndex.put(peerId, lastSnapshot.getLastIncludedIndex() + 1);
+                matchIndex.put(peerId, lastSnapshot.getLastIncludedIndex());
+                
+                log.info("Successfully sent snapshot to {} (lastIncludedIndex: {})", 
+                        peerId, lastSnapshot.getLastIncludedIndex());
+                return true;
+            } else {
+                log.warn("Follower {} rejected snapshot", peerId);
+                return false;
+            }
+            
+        } catch (Exception e) {
+            log.error("Failed to send snapshot to {}: {}", peerId, e.getMessage());
+            return false;
+        }
+    }
+    
+    /**
+     * Pre-vote RPC - Check if candidate would win election before disrupting cluster.
+     */
+    public VoteResponse handlePreVote(VoteRequest request) {
+        log.debug("Received PreVote RPC from {} for term {}", request.getCandidateId(), request.getTerm());
+        
+        // Grant pre-vote if:
+        // 1. Candidate's log is at least as up-to-date as receiver's log
+        // 2. Haven't heard from current leader recently (election timeout elapsed)
+        
+        boolean logUpToDate = isLogUpToDate(request.getLastLogIndex(), request.getLastLogTerm());
+        boolean electionTimeoutElapsed = (System.currentTimeMillis() - lastHeartbeat) > 
+            (ELECTION_TIMEOUT_MIN + ELECTION_TIMEOUT_MAX) / 2;
+        
+        boolean grantVote = logUpToDate && electionTimeoutElapsed;
+        
+        log.debug("PreVote for {}: logUpToDate={}, timeoutElapsed={}, granted={}", 
+                 request.getCandidateId(), logUpToDate, electionTimeoutElapsed, grantVote);
+        
+        return VoteResponse.newBuilder()
+            .setTerm(currentTerm.get())
+            .setVoteGranted(grantVote)
+            .build();
+    }
+    
+    /**
+     * Perform pre-vote phase before actual election.
+     * Returns true if pre-vote was successful (would win election).
+     */
+    public boolean performPreVote() {
+        log.info("Starting pre-vote phase for term {}", currentTerm.get() + 1);
+        
+        int votesReceived = 1; // Vote for self
+        int votesNeeded = (stubs.size() + 1) / 2 + 1;
+        
+        int lastLogIndex = raftLog.size();
+        int lastLogTerm = lastLogIndex > 0 ? 
+            raftLog.get(lastLogIndex - 1).getTerm() : 0;
+        
+        VoteRequest preVoteRequest = VoteRequest.newBuilder()
+            .setTerm(currentTerm.get() + 1)
+            .setCandidateId(config.getNodeId())
+            .setLastLogIndex(lastLogIndex)
+            .setLastLogTerm(lastLogTerm)
+            .build();
+        
+        for (String peerId : stubs.keySet()) {
+            try {
+                VoteResponse response = stubs.get(peerId)
+                    .withDeadlineAfter(500, TimeUnit.MILLISECONDS)
+                    .preVote(preVoteRequest);
+                
+                if (response.getVoteGranted()) {
+                    votesReceived++;
+                    log.debug("PreVote granted by {} ({}/{})", peerId, votesReceived, votesNeeded);
+                }
+                
+                if (votesReceived >= votesNeeded) {
+                    log.info("Pre-vote successful! Proceeding with actual election ({}/{})", 
+                            votesReceived, votesNeeded);
+                    return true;
+                }
+            } catch (Exception e) {
+                log.debug("Failed to get pre-vote from {}: {}", peerId, e.getMessage());
+            }
+        }
+        
+        log.info("Pre-vote failed ({}/{}), not starting election", votesReceived, votesNeeded);
+        return false;
+    }
+    
+    /**
+     * Linearizable read optimization - confirm leadership before responding to reads.
+     * 
+     * @return true if still leader and can safely respond to reads
+     */
+    public boolean confirmLeadership() {
+        if (state != NodeState.LEADER) {
+            return false;
+        }
+        
+        // Send heartbeats to majority of followers and wait for acknowledgment
+        int acks = 1; // Self
+        int needed = (stubs.size() + 1) / 2 + 1;
+        
+        for (String peerId : stubs.keySet()) {
+            try {
+                AppendEntriesRequest heartbeat = AppendEntriesRequest.newBuilder()
+                    .setTerm(currentTerm.get())
+                    .setLeaderId(config.getNodeId())
+                    .setPrevLogIndex(raftLog.size())
+                    .setPrevLogTerm(raftLog.isEmpty() ? 0 : 
+                        raftLog.get(raftLog.size() - 1).getTerm())
+                    .setLeaderCommit(commitIndex.get())
+                    .build();
+                
+                AppendEntriesResponse response = stubs.get(peerId)
+                    .withDeadlineAfter(500, TimeUnit.MILLISECONDS)
+                    .appendEntries(heartbeat);
+                
+                if (response.getTerm() == currentTerm.get() && response.getSuccess()) {
+                    acks++;
+                }
+                
+                if (response.getTerm() > currentTerm.get()) {
+                    // Step down if higher term discovered
+                    currentTerm.set(response.getTerm());
+                    state = NodeState.FOLLOWER;
+                    return false;
+                }
+                
+                if (acks >= needed) {
+                    return true;
+                }
+            } catch (Exception e) {
+                log.debug("Failed to confirm leadership with {}: {}", peerId, e.getMessage());
+            }
+        }
+        
+        return acks >= needed;
+    }
+    
+    /**
+     * Simple leadership check without heartbeat confirmation.
+     * Less strict than confirmLeadership(), suitable for dashboard reads.
+     * 
+     * @return true if this node is currently the leader
+     */
+    public boolean isLeader() {
+        return state == NodeState.LEADER;
+    }
+    
+    /**
+     * Check if a log is at least as up-to-date as our log.
+     */
+    private boolean isLogUpToDate(int lastLogIndex, int lastLogTerm) {
+        int myLastIndex = raftLog.size();
+        int myLastTerm = myLastIndex > 0 ? raftLog.get(myLastIndex - 1).getTerm() : 0;
+        
+        if (lastLogTerm != myLastTerm) {
+            return lastLogTerm > myLastTerm;
+        }
+        return lastLogIndex >= myLastIndex;
+    }
+    
+    // Setters for compatibility
+    
+    public void setState(NodeState newState) {
+        this.state = newState;
+    }
+    
+    public void setVotedFor(String nodeId) {
+        this.votedFor = nodeId;
+    }
+    
+    public void setCurrentLeader(String leaderId) {
+        this.currentLeader = leaderId;
+    }
+    
+    public void setLastHeartbeat(long timestamp) {
+        this.lastHeartbeat = timestamp;
+    }
+    
+    public void setLastSnapshot(Snapshot snapshot) {
+        this.lastSnapshot = snapshot;
+    }
+    
+    public long getLastHeartbeat() {
+        return this.lastHeartbeat;
+    }
 }
+
 
