@@ -3,6 +3,8 @@ package com.example.raftimplementation.service;
 import com.example.raftimplementation.config.RaftConfig;
 import com.example.raftimplementation.grpc.*;
 import com.example.raftimplementation.model.*;
+import com.example.raftimplementation.persistence.RaftPersistenceService;
+import com.example.raftimplementation.persistence.RaftStateEntity;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import lombok.Getter;
@@ -22,6 +24,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 @Getter
 public class RaftNode {
     private final RaftConfig config;
+    private final RaftPersistenceService persistenceService;
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(3);
     private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
     private final Map<String, RaftServiceGrpc.RaftServiceBlockingStub> stubs = new ConcurrentHashMap<>();
@@ -69,15 +72,42 @@ public class RaftNode {
     private static final int ELECTION_TIMEOUT_MAX = 5000;
     private static final int HEARTBEAT_INTERVAL = 1000;
     
-    public RaftNode(RaftConfig config) {
+    public RaftNode(RaftConfig config, RaftPersistenceService persistenceService) {
         this.config = config;
+        this.persistenceService = persistenceService;
     }
     
     @PostConstruct
     public void init() {
         log.info("Initializing Raft node: {}", config.getNodeId());
         
-
+        // Load persisted state (currentTerm, votedFor)
+        RaftStateEntity persistedState = persistenceService.loadState(config.getNodeId());
+        currentTerm.set(persistedState.getCurrentTerm());
+        votedFor = persistedState.getVotedFor();
+        log.info("Loaded persisted state: term={}, votedFor={}", currentTerm.get(), votedFor);
+        
+        // Load persisted log entries
+        List<LogEntry> persistedLog = persistenceService.loadLog(config.getNodeId());
+        synchronized (raftLog) {
+            raftLog.addAll(persistedLog);
+        }
+        log.info("Loaded {} persisted log entries", persistedLog.size());
+        
+        // Load persisted snapshot
+        persistenceService.loadSnapshot(config.getNodeId()).ifPresent(snapshot -> {
+            lastSnapshot = snapshot;
+            synchronized (stateMachine) {
+                stateMachine.clear();
+                stateMachine.addAll(snapshot.getStateMachineState());
+            }
+            commitIndex.set(Math.max(commitIndex.get(), snapshot.getLastIncludedIndex()));
+            lastApplied.set(Math.max(lastApplied.get(), snapshot.getLastIncludedIndex()));
+            log.info("Loaded persisted snapshot: lastIncludedIndex={}, stateMachineSize={}", 
+                    snapshot.getLastIncludedIndex(), stateMachine.size());
+        });
+        
+        // Connect to peers
         for (RaftConfig.PeerConfig peer : config.getPeers()) {
             if (!peer.getNodeId().equals(config.getNodeId())) {
                 ManagedChannel channel = ManagedChannelBuilder
@@ -229,6 +259,9 @@ public class RaftNode {
         votedFor = config.getNodeId();
         currentLeader = null;
         
+        // Persist state change (CRITICAL for Raft safety - must persist before sending RequestVote RPCs)
+        persistenceService.saveState(config.getNodeId(), currentTerm.get(), votedFor);
+        
         int votesReceived = 1;
         int votesNeeded = (stubs.size() + 2) / 2; 
         
@@ -315,6 +348,9 @@ public class RaftNode {
         state = NodeState.FOLLOWER;
         currentTerm.set(newTerm);
         votedFor = null;
+        
+        // Persist state change (CRITICAL for Raft safety)
+        persistenceService.saveState(config.getNodeId(), newTerm, null);
         
         if (heartbeatTask != null) {
             heartbeatTask.cancel(false);
@@ -554,6 +590,10 @@ public class RaftNode {
                 votedFor = request.getCandidateId();
                 voteGranted = true;
                 lastHeartbeat = System.currentTimeMillis();
+                
+                // Persist vote (CRITICAL for Raft safety - must persist before responding)
+                persistenceService.saveState(config.getNodeId(), currentTerm.get(), votedFor);
+                
                 startElectionTimer();
                 log.info("Voted for {}", request.getCandidateId());
                 logEvent(RaftEvent.EventType.VOTE_GRANTED, 
@@ -620,20 +660,37 @@ public class RaftNode {
         
         int newEntryIndex = request.getPrevLogIndex() + 1;
         int entriesAdded = 0;
+        List<LogEntry> entriesToPersist = new ArrayList<>();
+        
         for (GrpcLogEntry entry : request.getEntriesList()) {
             if (newEntryIndex < raftLog.size()) {
                 if (raftLog.get(newEntryIndex).getTerm() != entry.getTerm()) {
-                    raftLog.subList(newEntryIndex, raftLog.size()).clear();
+                    // Conflict detected - delete conflicting entries
+                    synchronized (raftLog) {
+                        raftLog.subList(newEntryIndex, raftLog.size()).clear();
+                        
+                        // Persist log deletion (CRITICAL for consistency)
+                        persistenceService.deleteLogEntriesFrom(config.getNodeId(), newEntryIndex);
+                    }
                 }
             }
             
             if (newEntryIndex >= raftLog.size()) {
                 // Convert gRPC entry back to internal LogEntry
                 LogEntry logEntry = convertFromGrpcLogEntry(entry);
-                raftLog.add(logEntry);
+                synchronized (raftLog) {
+                    raftLog.add(logEntry);
+                }
+                entriesToPersist.add(logEntry);
                 entriesAdded++;
             }
             newEntryIndex++;
+        }
+        
+        // Persist all new entries in batch (CRITICAL for durability)
+        if (!entriesToPersist.isEmpty()) {
+            int startIndex = request.getPrevLogIndex() + 1;
+            persistenceService.appendLogEntries(config.getNodeId(), startIndex, entriesToPersist);
         }
         
         if (entriesAdded > 0) {
@@ -668,9 +725,13 @@ public class RaftNode {
         logEvent(RaftEvent.EventType.COMMAND_RECEIVED, 
             "Received command from client: " + command);
         
-        LogEntry entry =
-            new LogEntry(currentTerm.get(), command);
-        raftLog.add(entry);
+        LogEntry entry = new LogEntry(currentTerm.get(), command);
+        synchronized (raftLog) {
+            raftLog.add(entry);
+            
+            // Persist log entry (CRITICAL for durability)
+            persistenceService.appendLogEntry(config.getNodeId(), raftLog.size() - 1, entry);
+        }
         
         sendHeartbeats();
         
@@ -951,9 +1012,15 @@ public class RaftNode {
             lastSnapshot = snapshot;
             totalSnapshots.incrementAndGet();
             
+            // Persist snapshot (CRITICAL for recovery after compaction)
+            persistenceService.saveSnapshot(config.getNodeId(), snapshot);
+            
             // Compact the log: remove entries up to lastIndex
             int entriesRemoved = compactLog(lastIndex);
             compactedEntries.addAndGet(entriesRemoved);
+            
+            // Persist log compaction (delete old entries from database)
+            persistenceService.compactLog(config.getNodeId(), lastIndex);
             
             log.info("Created snapshot at index {} (term {}), compacted {} entries, size: {} bytes",
                 lastIndex, lastTerm, entriesRemoved, sizeBytes);
@@ -1119,6 +1186,10 @@ public class RaftNode {
             currentTerm.set(request.getTerm());
             state = NodeState.FOLLOWER;
             votedFor = null;
+            
+            // Persist state change
+            persistenceService.saveState(config.getNodeId(), request.getTerm(), null);
+            
             logEvent(RaftEvent.EventType.TERM_INCREASED, 
                     "Term increased to " + request.getTerm() + " by InstallSnapshot from " + request.getLeaderId());
         }
@@ -1144,7 +1215,7 @@ public class RaftNode {
             
             @SuppressWarnings("unchecked")
             List<String> snapshotStateMachine = (List<String>) ois.readObject();
-            int snapshotTerm = ois.readInt();
+            ois.readInt(); // snapshotTerm - not used in current implementation
             
             // Calculate size for monitoring
             long sizeBytes = request.getData().size();
@@ -1186,6 +1257,10 @@ public class RaftNode {
             commitIndex.set(Math.max(commitIndex.get(), request.getLastIncludedIndex()));
             lastApplied.set(Math.max(lastApplied.get(), request.getLastIncludedIndex()));
             compactedEntries.addAndGet(request.getLastIncludedIndex());
+            
+            // Persist snapshot and compacted log (CRITICAL for recovery)
+            persistenceService.saveSnapshot(config.getNodeId(), snapshot);
+            persistenceService.compactLog(config.getNodeId(), request.getLastIncludedIndex());
             
             logEvent(RaftEvent.EventType.SNAPSHOT_INSTALLED, 
                     String.format("Installed snapshot from %s (index: %d, term: %d, size: %d entries)",
@@ -1249,6 +1324,10 @@ public class RaftNode {
                 currentTerm.set(response.getTerm());
                 state = NodeState.FOLLOWER;
                 votedFor = null;
+                
+                // Persist state change
+                persistenceService.saveState(config.getNodeId(), response.getTerm(), null);
+                
                 logEvent(RaftEvent.EventType.TERM_INCREASED, 
                         "Term increased to " + response.getTerm() + " by InstallSnapshot response from " + peerId);
                 return false;
@@ -1381,6 +1460,10 @@ public class RaftNode {
                     // Step down if higher term discovered
                     currentTerm.set(response.getTerm());
                     state = NodeState.FOLLOWER;
+                    
+                    // Persist state change
+                    persistenceService.saveState(config.getNodeId(), response.getTerm(), null);
+                    
                     return false;
                 }
                 
@@ -1426,6 +1509,8 @@ public class RaftNode {
     
     public void setVotedFor(String nodeId) {
         this.votedFor = nodeId;
+        // Persist state change
+        persistenceService.saveState(config.getNodeId(), currentTerm.get(), nodeId);
     }
     
     public void setCurrentLeader(String leaderId) {
