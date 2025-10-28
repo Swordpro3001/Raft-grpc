@@ -38,4 +38,28 @@ public class RaftGrpcService extends RaftServiceGrpc.RaftServiceImplBase {
             responseObserver.onError(e);
         }
     }
+    
+    @Override
+    public void installSnapshot(InstallSnapshotRequest request, StreamObserver<InstallSnapshotResponse> responseObserver) {
+        try {
+            InstallSnapshotResponse response = raftNode.handleInstallSnapshot(request);
+            responseObserver.onNext(response);
+            responseObserver.onCompleted();
+        } catch (Exception e) {
+            log.error("Error handling install snapshot", e);
+            responseObserver.onError(e);
+        }
+    }
+    
+    @Override
+    public void preVote(VoteRequest request, StreamObserver<VoteResponse> responseObserver) {
+        try {
+            VoteResponse response = raftNode.handlePreVote(request);
+            responseObserver.onNext(response);
+            responseObserver.onCompleted();
+        } catch (Exception e) {
+            log.error("Error handling pre-vote", e);
+            responseObserver.onError(e);
+        }
+    }
 }

@@ -74,6 +74,71 @@ public class RaftController {
         }
     }
     
+    /**
+     * Linearizable read endpoint.
+     * Ensures reads are up-to-date by confirming leadership before responding.
+     * Leader confirms it's still the leader via heartbeat to majority before reading.
+     * 
+     * @param index Optional specific index to read
+     * @param strict If true, performs full linearizable read with leadership confirmation.
+     *               If false (default), performs fast read from current leader state.
+     */
+    @GetMapping("/read")
+    public ResponseEntity<Map<String, Object>> linearizableRead(
+            @RequestParam(required = false) Integer index,
+            @RequestParam(required = false, defaultValue = "false") boolean strict) {
+        
+        if (raftNode.getState() != NodeState.LEADER) {
+            return ResponseEntity.ok(Map.of(
+                "success", false,
+                "message", "Not a leader. Current leader: " + raftNode.getCurrentLeader()
+            ));
+        }
+        
+        // Only confirm leadership if strict mode is enabled
+        if (strict) {
+            boolean isStillLeader = raftNode.confirmLeadership();
+            
+            if (!isStillLeader) {
+                return ResponseEntity.ok(Map.of(
+                    "success", false,
+                    "message", "Lost leadership during read operation"
+                ));
+            }
+        }
+        
+        // Read from state machine
+        List<String> stateMachine = raftNode.getStateMachine();
+        
+        if (index != null) {
+            if (index >= 0 && index < stateMachine.size()) {
+                return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "index", index,
+                    "value", stateMachine.get(index),
+                    "linearizable", strict,
+                    "leader", raftNode.getConfig().getNodeId()
+                ));
+            } else {
+                return ResponseEntity.ok(Map.of(
+                    "success", false,
+                    "message", "Index out of bounds",
+                    "index", index,
+                    "size", stateMachine.size()
+                ));
+            }
+        } else {
+            // Return entire state machine
+            return ResponseEntity.ok(Map.of(
+                "success", true,
+                "stateMachine", stateMachine,
+                "size", stateMachine.size(),
+                "linearizable", strict,
+                "leader", raftNode.getConfig().getNodeId()
+            ));
+        }
+    }
+    
     @GetMapping("/events")
     public ResponseEntity<List<RaftEvent>> getEvents() {
         return ResponseEntity.ok(raftNode.getEvents());

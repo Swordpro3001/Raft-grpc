@@ -9,6 +9,8 @@ package raft;
 service RaftService {
   rpc RequestVote(VoteRequest) returns (VoteResponse);
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+  rpc PreVote(VoteRequest) returns (VoteResponse);  // Pre-vote optimization
 }
 
 message VoteRequest {
@@ -56,4 +58,19 @@ message AppendEntriesResponse {
   int32 term = 1;
   bool success = 2;
   int32 matchIndex = 3;
+}
+
+message InstallSnapshotRequest {
+  int32 term = 1;
+  string leaderId = 2;
+  int32 lastIncludedIndex = 3;
+  int32 lastIncludedTerm = 4;
+  bytes data = 5;  // Serialized snapshot data
+  bool done = 6;   // For chunked transfer (future optimization)
+  int64 offset = 7; // For chunked transfer (future optimization)
+}
+
+message InstallSnapshotResponse {
+  int32 term = 1;
+  bool success = 2;
 }

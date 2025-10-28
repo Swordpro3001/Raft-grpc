@@ -237,6 +237,78 @@ public class ClientProxyController {
         return proxyToAnyNode("GET", "/snapshot/info", null);
     }
     
+    /**
+     * Linearizable read - proxy to the leader.
+     * This ensures strong consistency by confirming leadership before reading.
+     */
+    @GetMapping("/read")
+    public ResponseEntity<Map<String, Object>> linearizableRead(@RequestParam(required = false) Integer index) {
+        // First, find the current leader by checking node statuses
+        String leaderNodeId = null;
+        int leaderPort = -1;
+        
+        for (int port : NODE_PORTS) {
+            try {
+                String statusUrl = String.format("http://localhost:%d/api/status", port);
+                ResponseEntity<Map> statusResponse = restTemplate.getForEntity(statusUrl, Map.class);
+                
+                if (statusResponse.getStatusCode().is2xxSuccessful() && statusResponse.getBody() != null) {
+                    Map<String, Object> status = statusResponse.getBody();
+                    String state = (String) status.get("state");
+                    
+                    if ("LEADER".equals(state)) {
+                        leaderNodeId = (String) status.get("nodeId");
+                        leaderPort = port;
+                        log.info("Found leader: {} on port {}", leaderNodeId, leaderPort);
+                        break;
+                    }
+                }
+            } catch (Exception e) {
+                log.debug("Failed to get status from port {}: {}", port, e.getMessage());
+            }
+        }
+        
+        // If we found a leader, try to read from it
+        if (leaderPort != -1) {
+            try {
+                String url = String.format("http://localhost:%d/api/read", leaderPort);
+                if (index != null) {
+                    url += "?index=" + index;
+                }
+                
+                ResponseEntity<Map> response = restTemplate.getForEntity(url, Map.class);
+                
+                if (response.getStatusCode().is2xxSuccessful() && response.getBody() != null) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> body = response.getBody();
+                    
+                    if (body.get("success") != null && (Boolean) body.get("success")) {
+                        log.info("Linearizable read successful from leader {} on port {}", leaderNodeId, leaderPort);
+                        return ResponseEntity.ok(body);
+                    } else {
+                        log.warn("Leader {} rejected read: {}", leaderNodeId, body.get("message"));
+                        return ResponseEntity.ok(Map.of(
+                            "success", false,
+                            "message", "Leader rejected read: " + body.get("message")
+                        ));
+                    }
+                }
+            } catch (Exception e) {
+                log.error("Failed to perform linearizable read from leader on port {}: {}", leaderPort, e.getMessage());
+                return ResponseEntity.ok(Map.of(
+                    "success", false,
+                    "message", "Failed to contact leader: " + e.getMessage()
+                ));
+            }
+        }
+        
+        // No leader found, return error
+        return ResponseEntity.ok(Map.of(
+            "success", false,
+            "message", "No leader found in the cluster. Please wait for leader election to complete."
+        ));
+    }
+    
     // ==================== Helper Methods ====================
     
     /**
