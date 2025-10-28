@@ -817,6 +817,28 @@
             return null; // No node available
         }
         
+        async function findLeaderNode() {
+            // Try to find the current leader
+            for (const node of nodes) {
+                try {
+                    const response = await fetch(`http://localhost:${node.port}/api/status`, {
+                        method: 'GET',
+                        signal: AbortSignal.timeout(2000) // 2 second timeout
+                    });
+                    if (response.ok) {
+                        const data = await response.json();
+                        if (data.state === 'LEADER') {
+                            console.log(`Found leader: ${node.id} (port ${node.port})`);
+                            return node.port;
+                        }
+                    }
+                } catch (error) {
+                    // Node not available, try next
+                }
+            }
+            return null; // No leader found
+        }
+        
         function formatTimestamp(timestamp) {
             const date = new Date(timestamp);
             return date.toLocaleTimeString('de-DE', { 
@@ -1308,8 +1330,9 @@
                             ${status.stateMachine.length === 0 
                                 ? '<div class="state-machine-empty">Keine Commands ausgeführt</div>'
                                 : status.stateMachine.map((cmd, i) => {
-                                    // Calculate actual index: snapshotBaseIndex + i + 1
-                                    const actualIndex = (status.snapshotBaseIndex || 0) + i + 1;
+                                    // State machine contains ALL applied entries (including those in snapshot)
+                                    // Display as 1-indexed (i+1)
+                                    const actualIndex = i + 1;
                                     return `<div class="state-machine-item">${actualIndex}. ${cmd}</div>`;
                                 }).join('')
                             }
@@ -1454,20 +1477,21 @@
         }
         
         async function createSnapshot() {
-            const managerPort = await findAvailableManagerNode();
-            if (!managerPort) {
-                showMessage('✗ No node available to create snapshot', 'error');
+            // Find the leader node for snapshot creation
+            const leaderPort = await findLeaderNode();
+            if (!leaderPort) {
+                showMessage('✗ No leader available to create snapshot', 'error');
                 return;
             }
             
             try {
-                const response = await fetch(`http://localhost:${managerPort}/api/snapshot/create`, {
+                const response = await fetch(`http://localhost:${leaderPort}/api/snapshot/create`, {
                     method: 'POST'
                 });
                 const data = await response.json();
                 
                 if (data.success) {
-                    showMessage('✓ Snapshot created successfully!', 'success');
+                    showMessage('✓ Snapshot created successfully on leader!', 'success');
                     setTimeout(() => updateMonitoringMetrics(), 500);
                 } else {
                     showMessage(`✗ ${data.message}`, 'error');

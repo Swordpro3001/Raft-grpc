@@ -39,14 +39,14 @@ gradlew bootRun --args="--spring.profiles.active=node2"
 gradlew bootRun --args="--spring.profiles.active=node3"
 ```
 
-Open: [http://localhost:8081/index.html](http://localhost:8081/index.html)
+Open: [http://localhost:8080/index.html](http://localhost:8080/index.html)
 
 ## Core API
 
 ### Submit Commands
 ```bash
 # Auto-routes to leader
-curl -X POST http://localhost:8081/api/cluster/command \
+curl -X POST http://localhost:8080/api/cluster/command \
   -H "Content-Type: application/json" \
   -d '{"command": "SET key=value"}'
 ```
