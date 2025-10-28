@@ -243,6 +243,7 @@ public class RaftController {
     
     /**
      * Get replication status for all peers.
+     * Shows peer information from leader's perspective, or cluster info from follower's view.
      */
     @GetMapping("/metrics/replication")
     public Map<String, Object> getReplicationStatus() {
@@ -265,11 +266,34 @@ public class RaftController {
                 peerStatus.put(peerId, status);
             }
             
-            replication.put("peerStatus", peerStatus);
+            replication.put("peers", peerStatus);
             replication.put("isLeader", true);
+            replication.put("role", "LEADER");
         } else {
+            // For followers, show cluster membership information
+            Map<String, Map<String, Object>> clusterInfo = new HashMap<>();
+            
+            // Add information about known peers
+            for (String peerId : raftNode.getStubs().keySet()) {
+                Map<String, Object> peerInfo = new HashMap<>();
+                peerInfo.put("status", "Known Peer");
+                peerInfo.put("role", peerId.equals(raftNode.getCurrentLeader()) ? "LEADER" : "FOLLOWER");
+                clusterInfo.put(peerId, peerInfo);
+            }
+            
+            // Add current leader info
+            String currentLeader = raftNode.getCurrentLeader();
+            if (currentLeader != null && !clusterInfo.containsKey(currentLeader)) {
+                Map<String, Object> leaderInfo = new HashMap<>();
+                leaderInfo.put("status", "Current Leader");
+                leaderInfo.put("role", "LEADER");
+                clusterInfo.put(currentLeader, leaderInfo);
+            }
+            
+            replication.put("peers", clusterInfo);
             replication.put("isLeader", false);
-            replication.put("message", "Only leader can report replication status");
+            replication.put("role", raftNode.getState().name());
+            replication.put("currentLeader", currentLeader);
         }
         
         replication.put("nodeId", raftNode.getConfig().getNodeId());
@@ -320,17 +344,20 @@ public class RaftController {
         stats.put("currentLogSize", raftNode.getRaftLog().size());
         
         if (raftNode.getLastSnapshot() != null) {
-            stats.put("lastSnapshotIndex", raftNode.getLastSnapshot().getLastIncludedIndex());
-            stats.put("lastSnapshotTerm", raftNode.getLastSnapshot().getLastIncludedTerm());
-            stats.put("lastSnapshotTimestamp", raftNode.getLastSnapshot().getTimestamp());
-            stats.put("lastSnapshotSize", raftNode.getLastSnapshot().getSizeBytes());
+            Snapshot lastSnap = raftNode.getLastSnapshot();
+            Map<String, Object> snapshotInfo = new HashMap<>();
+            snapshotInfo.put("lastIncludedIndex", lastSnap.getLastIncludedIndex());
+            snapshotInfo.put("lastIncludedTerm", lastSnap.getLastIncludedTerm());
+            snapshotInfo.put("timestamp", lastSnap.getTimestamp());
+            snapshotInfo.put("sizeBytes", lastSnap.getSizeBytes());
+            stats.put("lastSnapshot", snapshotInfo);
         }
         
         int totalEntries = raftNode.getCompactedEntries().get() + raftNode.getRaftLog().size();
         double compressionRatio = totalEntries > 0 
             ? (double) raftNode.getCompactedEntries().get() / totalEntries * 100 
             : 0;
-        stats.put("compressionRatio", compressionRatio);
+        stats.put("compressionRatio", String.format("%.1f%%", compressionRatio));
         stats.put("nodeId", raftNode.getConfig().getNodeId());
         
         return stats;
@@ -606,22 +633,26 @@ public class RaftController {
     // ==================== Helper Methods ====================
     
     private double calculateAvgElectionTime() {
-        List<RaftEvent> elections = raftNode.getEvents().stream()
-            .filter(e -> e.getType() == RaftEvent.EventType.ELECTION_START || 
-                        e.getType() == RaftEvent.EventType.ELECTION_WON)
-            .collect(Collectors.toList());
-        
-        if (elections.size() < 2) return 0.0;
-        
+        List<RaftEvent> allEvents = raftNode.getEvents();
         List<Long> durations = new ArrayList<>();
-        for (int i = 0; i < elections.size() - 1; i++) {
-            if (elections.get(i).getType() == RaftEvent.EventType.ELECTION_START &&
-                elections.get(i + 1).getType() == RaftEvent.EventType.ELECTION_WON) {
-                long duration = java.time.Duration.between(
-                    elections.get(i).getTimestamp(),
-                    elections.get(i + 1).getTimestamp()
-                ).toMillis();
-                durations.add(duration);
+        
+        // Find all ELECTION_START events and match them with the next ELECTION_WON or ELECTION_LOST
+        for (int i = 0; i < allEvents.size(); i++) {
+            RaftEvent event = allEvents.get(i);
+            if (event.getType() == RaftEvent.EventType.ELECTION_START) {
+                // Look for the matching completion event
+                for (int j = i + 1; j < allEvents.size(); j++) {
+                    RaftEvent nextEvent = allEvents.get(j);
+                    if (nextEvent.getType() == RaftEvent.EventType.ELECTION_WON || 
+                        nextEvent.getType() == RaftEvent.EventType.ELECTION_LOST) {
+                        long duration = java.time.Duration.between(
+                            event.getTimestamp(),
+                            nextEvent.getTimestamp()
+                        ).toMillis();
+                        durations.add(duration);
+                        break;
+                    }
+                }
             }
         }
         
@@ -653,12 +684,32 @@ public class RaftController {
         java.time.LocalDateTime now = java.time.LocalDateTime.now();
         java.time.LocalDateTime oneMinuteAgo = now.minusMinutes(1);
         
+        // Count actual committed commands in the last minute
+        // We look for COMMAND_RECEIVED events that happened in the last minute
         long commandsInLastMinute = raftNode.getEvents().stream()
             .filter(e -> e.getType() == RaftEvent.EventType.COMMAND_RECEIVED)
             .filter(e -> e.getTimestamp().isAfter(oneMinuteAgo))
             .count();
         
-        return commandsInLastMinute / 60.0;
+        // Alternative: count state machine changes (more accurate for committed commands)
+        // This counts actual applied entries, not just received commands
+        Map<String, Object> status = raftNode.getStatus();
+        Integer commitIndex = (Integer) status.get("commitIndex");
+        Integer lastApplied = (Integer) status.get("lastApplied");
+        
+        // If we have applied entries, we can estimate throughput based on recent activity
+        // For a more accurate measure, we count command events
+        if (commandsInLastMinute > 0) {
+            return commandsInLastMinute / 60.0; // commands per second
+        }
+        
+        // If no recent commands but we have committed entries, show that the system is active
+        if (commitIndex != null && commitIndex > 0) {
+            // We have data but no recent activity, return 0
+            return 0.0;
+        }
+        
+        return 0.0;
     }
     
     private double calculateLeaderStability() {

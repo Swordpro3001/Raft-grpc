@@ -792,17 +792,10 @@
                 return;
             }
             
-            // Find an available manager node
-            const managerPort = await findAvailableManagerNode();
-            
-            if (!managerPort) {
-                showMessage('✗ Kein Node verfügbar für Command-Verarbeitung', 'error');
-                return;
-            }
-            
             try {
-                // Send command to NodeManagerController which will forward to leader
-                const response = await fetch(`http://localhost:${managerPort}/api/cluster/command`, {
+                // Always send command through the client proxy (port 8080)
+                // The proxy will automatically find an available leader
+                const response = await fetch(`http://localhost:8080/api/command`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ command })
@@ -811,7 +804,7 @@
                 const data = await response.json();
                 
                 if (data.success) {
-                    showMessage(`✓ Command erfolgreich verarbeitet (Leader: ${data.currentLeader || 'unknown'})`, 'success');
+                    showMessage(`✓ Command erfolgreich verarbeitet`, 'success');
                     input.value = '';
                     setTimeout(refreshStatus, 500);
                 } else {
@@ -1305,39 +1298,60 @@
         function updateReplicationStatus(data) {
             const container = document.getElementById('replicationStatus');
             
-            if (data.role !== 'LEADER' || !data.peers) {
+            if (!data.peers || Object.keys(data.peers).length === 0) {
                 container.innerHTML = `
                     <p style="color: #666; text-align: center; padding: 20px;">
-                        ${data.role === 'LEADER' ? 'No peers connected' : 'Only available on leader node'}
+                        No cluster information available
                     </p>
                 `;
                 return;
             }
             
             const peers = Object.entries(data.peers);
+            const isLeader = data.role === 'LEADER';
             
-            if (peers.length === 0) {
-                container.innerHTML = '<p style="color: #666; text-align: center; padding: 20px;">No peers</p>';
-                return;
-            }
+            // Add header showing current node's perspective
+            let headerHtml = `
+                <div style="background: ${isLeader ? '#e8f5e9' : '#e3f2fd'}; padding: 10px; border-radius: 6px; margin-bottom: 10px; text-align: center;">
+                    <strong>Viewing as: ${data.role}</strong>
+                    ${!isLeader && data.currentLeader ? ` | Current Leader: ${data.currentLeader}` : ''}
+                </div>
+            `;
             
-            container.innerHTML = peers.map(([peerId, status]) => {
-                const upToDate = status.upToDate;
-                const lag = status.lag || 0;
-                const lagClass = lag === 0 ? 'good' : 'warning';
-                const peerClass = upToDate ? 'up-to-date' : 'lagging';
-                
-                return `
-                    <div class="peer-status ${peerClass}">
-                        <div class="peer-name">${peerId}</div>
-                        <div class="peer-info">
-                            <span class="peer-lag">Match: ${status.matchIndex}</span>
-                            <span class="lag-badge ${lagClass}">
-                                ${lag === 0 ? '✓ Up-to-date' : `⚠ Lag: ${lag}`}
-                            </span>
+            container.innerHTML = headerHtml + peers.map(([peerId, status]) => {
+                if (isLeader) {
+                    // Leader view: show replication details
+                    const upToDate = status.upToDate;
+                    const lag = status.lag || 0;
+                    const lagClass = lag === 0 || lag < 0 ? 'good' : 'warning';
+                    const peerClass = upToDate ? 'up-to-date' : 'lagging';
+                    
+                    return `
+                        <div class="peer-status ${peerClass}">
+                            <div class="peer-name">${peerId}</div>
+                            <div class="peer-info">
+                                <span class="peer-lag">Match: ${status.matchIndex}</span>
+                                <span class="lag-badge ${lagClass}">
+                                    ${lag <= 0 ? 'Up-to-date' : `Lag: ${lag}`}
+                                </span>
+                            </div>
                         </div>
-                    </div>
-                `;
+                    `;
+                } else {
+                    // Follower view: show cluster members
+                    const peerRole = status.role || 'FOLLOWER';
+                    const roleClass = peerRole === 'LEADER' ? 'up-to-date' : 'lagging';
+                    const roleIcon = peerRole === 'LEADER' ? '👑' : '📡';
+                    
+                    return `
+                        <div class="peer-status ${roleClass}">
+                            <div class="peer-name">${roleIcon} ${peerId}</div>
+                            <div class="peer-info">
+                                <span class="peer-lag">${status.status || peerRole}</span>
+                            </div>
+                        </div>
+                    `;
+                }
             }).join('');
         }
         

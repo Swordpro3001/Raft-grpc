@@ -57,6 +57,15 @@ public class ClientProxyController {
      * Proxy command submission to the cluster.
      * Finds a leader and forwards the command.
      */
+    @PostMapping("/command")
+    public ResponseEntity<Map<String, Object>> submitCommandDirect(@RequestBody Map<String, String> request) {
+        return submitCommand(request);
+    }
+    
+    /**
+     * Proxy command submission to the cluster (alternative endpoint).
+     * Finds a leader and forwards the command.
+     */
     @PostMapping("/cluster/command")
     public ResponseEntity<Map<String, Object>> submitCommand(@RequestBody Map<String, String> request) {
         String command = request.get("command");
@@ -66,7 +75,8 @@ public class ClientProxyController {
                 .body(Map.of("success", false, "message", "Command is required"));
         }
         
-        // Try to find a node that can handle the command
+        // Try to find a leader that can handle the command
+        Map<String, Object> lastErrorResponse = null;
         for (int port : NODE_PORTS) {
             try {
                 String url = String.format("http://localhost:%d/api/command", port);
@@ -76,12 +86,29 @@ public class ClientProxyController {
                     Map.class
                 );
                 
-                if (response.getStatusCode().is2xxSuccessful()) {
-                    return ResponseEntity.ok(response.getBody());
+                if (response.getStatusCode().is2xxSuccessful() && response.getBody() != null) {
+                    Map<String, Object> body = response.getBody();
+                    // Check if the command was actually successful
+                    if (body.get("success") != null && (Boolean) body.get("success")) {
+                        log.info("Command successfully submitted to node on port {}", port);
+                        return ResponseEntity.ok(body);
+                    } else {
+                        // Command was rejected (not a leader or suspended)
+                        lastErrorResponse = body;
+                        log.debug("Node on port {} rejected command: {}", port, body.get("message"));
+                    }
                 }
             } catch (Exception e) {
-                log.debug("Failed to submit command to node on port {}: {}", port, e.getMessage());
+                log.debug("Failed to contact node on port {}: {}", port, e.getMessage());
             }
+        }
+        
+        // No node could handle the command
+        if (lastErrorResponse != null) {
+            return ResponseEntity.ok(Map.of(
+                "success", false, 
+                "message", "Could not find active leader. Last error: " + lastErrorResponse.get("message")
+            ));
         }
         
         return ResponseEntity.status(503)
