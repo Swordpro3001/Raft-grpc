@@ -70,24 +70,61 @@ jobs:
     
     - name: Verify H2 Database Creation
       run: |
-        ./gradlew bootRun --args='--spring.profiles.active=node1' &
+        echo "Starting node1 to verify H2 database creation..."
+        ./gradlew bootRun --args='--spring.profiles.active=node1' > node1-db-test.log 2>&1 &
         APP_PID=$!
-        sleep 20
+        echo "Node1 PID: $APP_PID"
         
-        # Check if database files were created (H2 may create .mv.db or .db file)
+        # Wait for application to start and create database
+        echo "Waiting for application to start..."
+        sleep 30
+        
+        # Check if process is still running
+        if ! kill -0 $APP_PID 2>/dev/null; then
+          echo "✗ Application process died"
+          cat node1-db-test.log
+          exit 1
+        fi
+        
+        # Try to connect to the application
+        echo "Checking if application is responding..."
+        for i in {1..10}; do
+          if curl -s http://localhost:8081/api/status > /dev/null 2>&1; then
+            echo "✓ Application is responding"
+            break
+          fi
+          echo "  Attempt $i: waiting for application..."
+          sleep 2
+        done
+        
+        # Submit a command to ensure database operations happen
+        echo "Submitting test command to trigger database writes..."
+        curl -s -X POST http://localhost:8081/api/command \
+          -H "Content-Type: application/json" \
+          -d '{"command": "test-db-creation"}' || true
+        
+        sleep 5
+        
+        # Check if database files were created
+        echo "Checking for database files..."
+        ls -la data/node1/ || true
+        
         if [ -f "data/node1/raft-db.mv.db" ] || [ -f "data/node1/raft-db.db" ] || ls data/node1/*.db 2>/dev/null; then
           echo "✓ H2 database file created successfully"
-          ls -la data/node1/ || true
+          ls -la data/node1/
         else
           echo "✗ H2 database file not found"
           echo "Checking data directory structure:"
-          ls -la data/ || echo "data/ directory does not exist"
-          ls -la data/node1/ || echo "data/node1/ directory does not exist"
+          ls -la . | grep data || echo "No data directory found in current path"
+          find . -name "*.db" -type f 2>/dev/null || echo "No .db files found"
+          echo "Application log:"
+          cat node1-db-test.log
           kill $APP_PID 2>/dev/null || true
           exit 1
         fi
         
-        kill $APP_PID
+        # Cleanup
+        kill $APP_PID 2>/dev/null || true
         sleep 2
         
     - name: Upload Database Files

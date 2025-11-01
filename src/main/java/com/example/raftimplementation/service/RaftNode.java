@@ -35,8 +35,8 @@ public class RaftNode {
     private volatile String votedFor = null;
     private volatile String currentLeader = null;
     private final List<LogEntry> raftLog = Collections.synchronizedList(new ArrayList<>());
-    private final AtomicInteger commitIndex = new AtomicInteger(0);
-    private final AtomicInteger lastApplied = new AtomicInteger(0);
+    private final AtomicInteger commitIndex = new AtomicInteger(-1);  // Start at -1: no entries committed yet
+    private final AtomicInteger lastApplied = new AtomicInteger(-1);   // Start at -1: no entries applied yet
     
 
     private final Map<String, Integer> nextIndex = new ConcurrentHashMap<>();
@@ -325,8 +325,12 @@ public class RaftNode {
         int lastLogIndexPlusOne = getLastLogIndex() + 1;
         for (String peerId : stubs.keySet()) {
             nextIndex.put(peerId, lastLogIndexPlusOne);
-            matchIndex.put(peerId, 0);  // Logical index: 0 = follower has no entries replicated yet
+            matchIndex.put(peerId, -1);  // -1 = follower has no entries replicated yet
         }
+        
+        // Leader implicitly has all its own log entries replicated
+        // This allows the first entry to be committed immediately once majority confirms
+        matchIndex.put(config.getNodeId(), getLastLogIndex());
         
         if (heartbeatTask != null) {
             heartbeatTask.cancel(false);
@@ -453,17 +457,22 @@ public class RaftNode {
         }
         
         // Collect match indices (logical indices) from all peers + self
+        // Note: matchIndex now includes the leader's own nodeId
         List<Integer> indices = new ArrayList<>(matchIndex.values());
-        indices.add(getLastLogIndex());  // Leader has all entries
         Collections.sort(indices, Collections.reverseOrder());
         
-        // Find the median (majority) index
-        int majorityIndex = (stubs.size() + 1) / 2;
-        if (majorityIndex < indices.size()) {
-            int newCommitIndex = indices.get(majorityIndex);
+        // Find the majority index (median)
+        // Total nodes = stubs.size() (peers) + 1 (self)
+        // Majority position = totalNodes / 2 (0-indexed, so this gives us the median)
+        int totalNodes = stubs.size() + 1;
+        int majorityPosition = totalNodes / 2;
+        
+        if (majorityPosition < indices.size()) {
+            int newCommitIndex = indices.get(majorityPosition);
             
             // Only commit entries from current term (Raft safety requirement)
-            if (newCommitIndex > commitIndex.get() && getLogTermAt(newCommitIndex) == currentTerm.get()) {
+            // Also skip if newCommitIndex is -1 (no entries replicated yet)
+            if (newCommitIndex >= 0 && newCommitIndex > commitIndex.get() && getLogTermAt(newCommitIndex) == currentTerm.get()) {
                 commitIndex.set(newCommitIndex);
                 log.debug("Updated commit index to {} (logical)", newCommitIndex);
                 applyCommittedEntries();
@@ -761,6 +770,9 @@ public class RaftNode {
             // Persist log entry (CRITICAL for durability)
             int logicalIndex = getLastLogIndex();
             persistenceService.appendLogEntry(config.getNodeId(), logicalIndex, entry);
+            
+            // Leader has this entry immediately replicated on itself
+            matchIndex.put(config.getNodeId(), logicalIndex);
         }
         
         sendHeartbeats();
@@ -879,8 +891,11 @@ public class RaftNode {
         status.put("state", suspended ? "SUSPENDED" : state.name());
         status.put("currentTerm", currentTerm.get());
         status.put("currentLeader", currentLeader);
-        status.put("commitIndex", commitIndex.get());
-        status.put("lastApplied", lastApplied.get());
+        // Display commitIndex as COUNT of committed entries (not index)
+        // Internal: -1 = nothing committed, 0 = 1 entry committed, etc.
+        // Display: 0 = nothing committed, 1 = 1 entry committed, etc.
+        status.put("commitIndex", commitIndex.get() + 1);
+        status.put("lastApplied", lastApplied.get() + 1);
         // Return logical log size: total entries including those in snapshot
         int logicalLogSize = getLogBaseIndex() + raftLog.size();
         status.put("logSize", logicalLogSize);
