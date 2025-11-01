@@ -29,7 +29,7 @@ public class LogEntryEntity {
     private String nodeId;
     
     /**
-     * Index of this entry in the log (0-based).
+     * Logical index of this entry in the log. -1 represents "no entries", valid entries start at index 0.
      */
     @Column(nullable = false)
     private int logIndex;
