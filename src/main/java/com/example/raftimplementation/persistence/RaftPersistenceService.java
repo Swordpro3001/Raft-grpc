@@ -79,11 +79,7 @@ public class RaftPersistenceService {
         List<LogEntry> logEntries = new ArrayList<>();
         
         for (LogEntryEntity entity : entities) {
-            if (entity.getConfiguration() != null) {
-                logEntries.add(new LogEntry(entity.getTerm(), entity.getCommand(), entity.getConfiguration()));
-            } else {
-                logEntries.add(new LogEntry(entity.getTerm(), entity.getCommand()));
-            }
+            logEntries.add(new LogEntry(entity.getTerm(), entity.getCommand()));
         }
         
         log.info("Loaded {} log entries for {} from persistent storage", logEntries.size(), nodeId);
