@@ -117,6 +117,12 @@ jobs:
     - name: Build application
       run: ./gradlew build -x test
     
+    - name: Clean old data
+      run: |
+        # Remove old database and data files to start fresh
+        rm -rf data/
+        rm -rf *.log
+    
     - name: Start 3-Node Cluster
       run: |
         nohup ./gradlew bootRun --args='--spring.profiles.active=node1' > node1.log 2>&1 &
@@ -181,11 +187,18 @@ jobs:
         
         echo "Leader is on port $LEADER_PORT"
         
-        # Submit 5 commands
+        # Get initial state machine size from leader
+        INITIAL_RESPONSE=$(curl -s http://localhost:$LEADER_PORT/api/status)
+        INITIAL_SIZE=$(echo "$INITIAL_RESPONSE" | grep -o '"stateMachine":\[[^]]*\]' | grep -o ',' | wc -l)
+        INITIAL_SIZE=$((INITIAL_SIZE + 1))  # Add 1 because commas are n-1
+        echo "Initial state machine size: $INITIAL_SIZE"
+        
+        # Submit 5 commands with unique test prefix
+        TEST_ID="ci-test-$$"
         for i in {1..5}; do
           curl -s -X POST http://localhost:$LEADER_PORT/api/command \
             -H "Content-Type: application/json" \
-            -d "{\"command\": \"test-cmd-$i\"}"
+            -d "{\"command\": \"${TEST_ID}-cmd-$i\"}"
           sleep 1
         done
         
@@ -194,14 +207,17 @@ jobs:
         # Verify replication on all nodes
         for PORT in 8081 8082 8083; do
           RESPONSE=$(curl -s http://localhost:$PORT/api/status)
-          STATE_MACHINE=$(echo "$RESPONSE" | grep -o '"stateMachine":\[.*\]' || echo "")
-          ENTRY_COUNT=$(echo "$STATE_MACHINE" | grep -o 'test-cmd' | wc -l)
+          # Count occurrences of our test ID
+          ENTRY_COUNT=$(echo "$RESPONSE" | grep -o "$TEST_ID" | wc -l)
           
           if [ "$ENTRY_COUNT" -ge 5 ]; then
             echo "✓ Node on port $PORT: $ENTRY_COUNT commands replicated"
           else
             echo "✗ Node on port $PORT: only $ENTRY_COUNT commands (expected 5)"
-            echo "Response: $RESPONSE"
+            # Get state machine size for debugging
+            FINAL_SIZE=$(echo "$RESPONSE" | grep -o '"stateMachine":\[[^]]*\]' | grep -o ',' | wc -l)
+            FINAL_SIZE=$((FINAL_SIZE + 1))
+            echo "State machine size: $FINAL_SIZE (was $INITIAL_SIZE initially)"
             exit 1
           fi
         done
@@ -270,14 +286,15 @@ jobs:
         
         echo "Leader is on port $LEADER_PORT"
         
-        # Submit more commands
-        for i in {6..15}; do
+        # Submit many more commands to reach snapshot threshold (100)
+        TEST_ID="ci-snap-$$"
+        for i in {1..100}; do
           curl -s -X POST http://localhost:$LEADER_PORT/api/command \
             -H "Content-Type: application/json" \
-            -d "{\"command\": \"snap-test-$i\"}"
+            -d "{\"command\": \"${TEST_ID}-$i\"}" > /dev/null
         done
         
-        sleep 3
+        sleep 5
         
         # Create snapshot
         RESPONSE=$(curl -s -X POST http://localhost:$LEADER_PORT/api/snapshot/create)
