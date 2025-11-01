@@ -11,7 +11,8 @@ import java.util.*;
 
 /**
  * Client-side controller that proxies requests to Raft nodes.
- * This controller is only active when running in client mode (raft.node.enabled=false).
+ * This controller is only active when running in OLD client mode (raft.node.enabled=false AND management.enabled=false).
+ * DEPRECATED: Use ManagementProxyController instead.
  * It communicates with the Raft cluster nodes via REST API.
  * 
  * Endpoints:
@@ -22,13 +23,17 @@ import java.util.*;
  * - POST /api/cluster/*        - Cluster management operations
  * - GET  /api/metrics/*        - Performance metrics (proxied to nodes)
  * - POST /api/snapshot/*       - Snapshot operations (proxied to nodes)
+ * 
+ * @deprecated Use ManagementService with ManagementProxyController instead
  */
 @RestController
 @RequestMapping("/api")
 @RequiredArgsConstructor
 @CrossOrigin(origins = "*")
 @ConditionalOnProperty(name = "raft.node.enabled", havingValue = "false")
+@ConditionalOnProperty(name = "management.enabled", havingValue = "false", matchIfMissing = true)
 @Slf4j
+@Deprecated
 public class ClientProxyController {
     
     private final RestTemplate restTemplate;

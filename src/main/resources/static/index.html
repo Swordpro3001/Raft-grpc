@@ -859,8 +859,8 @@
             }
             
             try {
-                // Always send command through the client proxy (port 8080)
-                // The proxy will automatically find an available leader
+                // Send command through the management node (backward compatible API)
+                // Management node will forward to the current leader
                 const response = await fetch(`http://localhost:8080/api/command`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -874,7 +874,7 @@
                     input.value = '';
                     setTimeout(refreshStatus, 500);
                 } else {
-                    showMessage(`✗ ${data.message}`, 'error');
+                    showMessage(`✗ ${data.error || data.message}`, 'error');
                 }
             } catch (error) {
                 showMessage(`✗ Fehler beim Senden des Commands: ${error.message}`, 'error');
@@ -913,7 +913,7 @@
                     
                     readResult.innerHTML = `
                         <h3>
-                            🔒 Read Result from Leader
+                             Read Result from Leader
                             ${isLinearizable 
                                 ? '<span class="linearizable-badge">✓ Linearizable</span>'
                                 : '<span class="linearizable-badge" style="background: #2196f3;">Fast Read</span>'
@@ -1050,15 +1050,8 @@
         }
         
         async function suspendNode(nodeId) {
-            const managerPort = await findAvailableManagerNode();
-            
-            if (!managerPort) {
-                showMessage(`✗ Kein Node verfügbar für Management-Operationen`, 'error');
-                return;
-            }
-            
             try {
-                const response = await fetch(`http://localhost:${managerPort}/api/nodes/${nodeId}/suspend`, {
+                const response = await fetch(`http://localhost:8080/api/nodes/${nodeId}/suspend`, {
                     method: 'POST'
                 });
                 const data = await response.json();
@@ -1067,7 +1060,7 @@
                     showMessage(`✓ ${nodeId} wurde suspendiert`, 'success');
                     setTimeout(refreshStatus, 500);
                 } else {
-                    showMessage(`✗ ${data.message}`, 'error');
+                    showMessage(`✗ ${data.error || data.message}`, 'error');
                 }
             } catch (error) {
                 showMessage(`✗ Fehler beim Suspendieren von ${nodeId}: ${error.message}`, 'error');
@@ -1075,15 +1068,8 @@
         }
         
         async function resumeNode(nodeId) {
-            const managerPort = await findAvailableManagerNode();
-            
-            if (!managerPort) {
-                showMessage(`✗ Kein Node verfügbar für Management-Operationen`, 'error');
-                return;
-            }
-            
             try {
-                const response = await fetch(`http://localhost:${managerPort}/api/nodes/${nodeId}/resume`, {
+                const response = await fetch(`http://localhost:8080/api/nodes/${nodeId}/resume`, {
                     method: 'POST'
                 });
                 const data = await response.json();
@@ -1092,7 +1078,7 @@
                     showMessage(`✓ ${nodeId} wurde wiederaufgenommen`, 'success');
                     setTimeout(refreshStatus, 500);
                 } else {
-                    showMessage(`✗ ${data.message}`, 'error');
+                    showMessage(`✗ ${data.error || data.message}`, 'error');
                 }
             } catch (error) {
                 showMessage(`✗ Fehler beim Wiederaufnehmen von ${nodeId}: ${error.message}`, 'error');
@@ -1347,20 +1333,24 @@
                 return; // Don't poll when page is hidden
             }
             
-            const statuses = await Promise.all(
-                nodes.map(node => fetchNodeStatus(node))
-            );
-            
-            // Update each node card individually (only if changed)
-            statuses.forEach(status => {
-                updateNodeCard(status.nodeId, status);
-            });
-            
-            // Update cluster info
-            updateClusterInfo(statuses);
-            
-            // Update monitoring metrics
-            await updateMonitoringMetrics();
+            try {
+                // Fetch all node statuses (backward compatible with old /api/nodes)
+                const response = await fetch('http://localhost:8080/api/nodes');
+                const statuses = await response.json();
+                
+                // Update each node card individually (only if changed)
+                statuses.forEach(status => {
+                    updateNodeCard(status.nodeId, status);
+                });
+                
+                // Update cluster info
+                updateClusterInfo(statuses);
+                
+                // Update monitoring metrics
+                await updateMonitoringMetrics();
+            } catch (error) {
+                console.error('Error refreshing status:', error);
+            }
         }
         
         async function updateMonitoringMetrics() {
@@ -1477,24 +1467,18 @@
         }
         
         async function createSnapshot() {
-            // Find the leader node for snapshot creation
-            const leaderPort = await findLeaderNode();
-            if (!leaderPort) {
-                showMessage('✗ No leader available to create snapshot', 'error');
-                return;
-            }
-            
             try {
-                const response = await fetch(`http://localhost:${leaderPort}/api/snapshot/create`, {
+                // Create snapshot via management node (uses backward compatible API)
+                const response = await fetch(`http://localhost:8080/api/snapshot/create`, {
                     method: 'POST'
                 });
                 const data = await response.json();
                 
                 if (data.success) {
-                    showMessage('✓ Snapshot created successfully on leader!', 'success');
+                    showMessage('✓ Snapshot created successfully!', 'success');
                     setTimeout(() => updateMonitoringMetrics(), 500);
                 } else {
-                    showMessage(`✗ ${data.message}`, 'error');
+                    showMessage(`✗ ${data.error || data.message}`, 'error');
                 }
             } catch (error) {
                 showMessage(`✗ Error creating snapshot: ${error.message}`, 'error');

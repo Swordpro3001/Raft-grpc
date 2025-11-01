@@ -12,9 +12,9 @@ if errorlevel 1 (
 
 echo Starting Nodes silently in background...
 
-rem === Dashboard Client ===
-echo Starting Dashboard Client...
-powershell -WindowStyle Hidden -Command "Start-Process 'cmd.exe' -ArgumentList '/c gradlew.bat bootRun --args=--spring.profiles.active=client' -WindowStyle Hidden"
+rem === Management Node (independent from Raft) ===
+echo Starting Management Node...
+powershell -WindowStyle Hidden -Command "Start-Process 'cmd.exe' -ArgumentList '/c gradlew.bat bootRun --args=--spring.profiles.active=management' -WindowStyle Hidden"
 
 timeout /t 3 /nobreak >nul
 
@@ -39,7 +39,9 @@ echo.
 echo All nodes started in background!
 
 echo.
-echo Dashboard: http://localhost:8080
+echo Management Dashboard: http://localhost:8080
+echo Management API: http://localhost:8080/api/management/cluster/overview
+echo.
 echo Node 1: http://localhost:8081/api/status
 echo Node 2: http://localhost:8082/api/status
 echo Node 3: http://localhost:8083/api/status
