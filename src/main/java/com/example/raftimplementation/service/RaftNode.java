@@ -1091,7 +1091,6 @@ public class RaftNode {
         }
         
         // Calculate how many entries to remove based on current baseIndex
-        int currentBaseIndex = getLogBaseIndex();
         
         // If we don't have a snapshot yet, base is 0, so we remove entries 0..snapshotIndex (inclusive)
         // If we already have a snapshot, we need to calculate physical positions
