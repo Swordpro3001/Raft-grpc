@@ -3,6 +3,8 @@ package com.example.raftimplementation.service;
 import com.example.raftimplementation.config.RaftConfig;
 import com.example.raftimplementation.grpc.*;
 import com.example.raftimplementation.model.*;
+import com.example.raftimplementation.persistence.RaftPersistenceService;
+import com.example.raftimplementation.persistence.RaftStateEntity;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import lombok.Getter;
@@ -22,6 +24,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 @Getter
 public class RaftNode {
     private final RaftConfig config;
+    private final RaftPersistenceService persistenceService;
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(3);
     private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
     private final Map<String, RaftServiceGrpc.RaftServiceBlockingStub> stubs = new ConcurrentHashMap<>();
@@ -32,8 +35,8 @@ public class RaftNode {
     private volatile String votedFor = null;
     private volatile String currentLeader = null;
     private final List<LogEntry> raftLog = Collections.synchronizedList(new ArrayList<>());
-    private final AtomicInteger commitIndex = new AtomicInteger(0);
-    private final AtomicInteger lastApplied = new AtomicInteger(0);
+    private final AtomicInteger commitIndex = new AtomicInteger(-1);  // Start at -1: no entries committed yet
+    private final AtomicInteger lastApplied = new AtomicInteger(-1);   // Start at -1: no entries applied yet
     
 
     private final Map<String, Integer> nextIndex = new ConcurrentHashMap<>();
@@ -69,15 +72,42 @@ public class RaftNode {
     private static final int ELECTION_TIMEOUT_MAX = 5000;
     private static final int HEARTBEAT_INTERVAL = 1000;
     
-    public RaftNode(RaftConfig config) {
+    public RaftNode(RaftConfig config, RaftPersistenceService persistenceService) {
         this.config = config;
+        this.persistenceService = persistenceService;
     }
     
     @PostConstruct
     public void init() {
         log.info("Initializing Raft node: {}", config.getNodeId());
         
-
+        // Load persisted state (currentTerm, votedFor)
+        RaftStateEntity persistedState = persistenceService.loadState(config.getNodeId());
+        currentTerm.set(persistedState.getCurrentTerm());
+        votedFor = persistedState.getVotedFor();
+        log.info("Loaded persisted state: term={}, votedFor={}", currentTerm.get(), votedFor);
+        
+        // Load persisted log entries
+        List<LogEntry> persistedLog = persistenceService.loadLog(config.getNodeId());
+        synchronized (raftLog) {
+            raftLog.addAll(persistedLog);
+        }
+        log.info("Loaded {} persisted log entries", persistedLog.size());
+        
+        // Load persisted snapshot
+        persistenceService.loadSnapshot(config.getNodeId()).ifPresent(snapshot -> {
+            lastSnapshot = snapshot;
+            synchronized (stateMachine) {
+                stateMachine.clear();
+                stateMachine.addAll(snapshot.getStateMachineState());
+            }
+            commitIndex.set(Math.max(commitIndex.get(), snapshot.getLastIncludedIndex()));
+            lastApplied.set(Math.max(lastApplied.get(), snapshot.getLastIncludedIndex()));
+            log.info("Loaded persisted snapshot: lastIncludedIndex={}, stateMachineSize={}", 
+                    snapshot.getLastIncludedIndex(), stateMachine.size());
+        });
+        
+        // Connect to peers
         for (RaftConfig.PeerConfig peer : config.getPeers()) {
             if (!peer.getNodeId().equals(config.getNodeId())) {
                 ManagedChannel channel = ManagedChannelBuilder
@@ -229,6 +259,9 @@ public class RaftNode {
         votedFor = config.getNodeId();
         currentLeader = null;
         
+        // Persist state change (CRITICAL for Raft safety - must persist before sending RequestVote RPCs)
+        persistenceService.saveState(config.getNodeId(), currentTerm.get(), votedFor);
+        
         int votesReceived = 1;
         int votesNeeded = (stubs.size() + 2) / 2; 
         
@@ -236,8 +269,8 @@ public class RaftNode {
         logEvent(RaftEvent.EventType.ELECTION_START,
             "Starting election, need " + votesNeeded + " votes");
         
-        int lastLogIndex = raftLog.size() - 1;
-        int lastLogTerm = lastLogIndex >= 0 ? raftLog.get(lastLogIndex).getTerm() : 0;
+        int lastLogIndex = getLastLogIndex();
+        int lastLogTerm = getLogTermAt(lastLogIndex);
         
         VoteRequest voteRequest = VoteRequest.newBuilder()
             .setTerm(currentTerm.get())
@@ -288,10 +321,16 @@ public class RaftNode {
         state = NodeState.LEADER;
         currentLeader = config.getNodeId();
 
+        // Initialize nextIndex for each peer to leader's last log index + 1 (logical index)
+        int lastLogIndexPlusOne = getLastLogIndex() + 1;
         for (String peerId : stubs.keySet()) {
-            nextIndex.put(peerId, raftLog.size());
-            matchIndex.put(peerId, 0);  // COUNT-based: 0 = follower has no entries replicated yet
+            nextIndex.put(peerId, lastLogIndexPlusOne);
+            matchIndex.put(peerId, -1);  // -1 = follower has no entries replicated yet
         }
+        
+        // Leader implicitly has all its own log entries replicated
+        // This allows the first entry to be committed immediately once majority confirms
+        matchIndex.put(config.getNodeId(), getLastLogIndex());
         
         if (heartbeatTask != null) {
             heartbeatTask.cancel(false);
@@ -316,6 +355,9 @@ public class RaftNode {
         currentTerm.set(newTerm);
         votedFor = null;
         
+        // Persist state change (CRITICAL for Raft safety)
+        persistenceService.saveState(config.getNodeId(), newTerm, null);
+        
         if (heartbeatTask != null) {
             heartbeatTask.cancel(false);
         }
@@ -332,7 +374,7 @@ public class RaftNode {
             String peerId = entry.getKey();
             RaftServiceGrpc.RaftServiceBlockingStub stub = entry.getValue();
             
-            int peerNextIndex = nextIndex.getOrDefault(peerId, 0);
+            int peerNextIndex = nextIndex.getOrDefault(peerId, getLogBaseIndex());
             
             // Check if follower is too far behind and needs snapshot
             if (lastSnapshot != null && peerNextIndex <= lastSnapshot.getLastIncludedIndex()) {
@@ -350,10 +392,19 @@ public class RaftNode {
             }
             
             int prevLogIndex = peerNextIndex - 1;
-            int prevLogTerm = prevLogIndex >= 0 && prevLogIndex < raftLog.size() ? raftLog.get(prevLogIndex).getTerm() : 0;
+            int prevLogTerm;
+            
+            if (prevLogIndex < 0) {
+                prevLogTerm = 0;
+            } else if (lastSnapshot != null && prevLogIndex == lastSnapshot.getLastIncludedIndex()) {
+                prevLogTerm = lastSnapshot.getLastIncludedTerm();
+            } else {
+                prevLogTerm = getLogTermAt(prevLogIndex);
+            }
             
             List<GrpcLogEntry> entries = new ArrayList<>();
-            for (int i = peerNextIndex; i < raftLog.size(); i++) {
+            int startPhysicalIndex = logicalToPhysical(peerNextIndex);
+            for (int i = Math.max(0, startPhysicalIndex); i < raftLog.size(); i++) {
                 LogEntry entry1 = raftLog.get(i);
                 entries.add(convertToGrpcLogEntry(entry1));
             }
@@ -377,15 +428,18 @@ public class RaftNode {
                 
                 if (response.getSuccess()) {
                     if (!entries.isEmpty()) {
-                        // COUNT-based: how many entries the follower now has
-                        int newMatchCount = prevLogIndex + 1 + entries.size();
-                        matchIndex.put(peerId, newMatchCount);
-                        nextIndex.put(peerId, newMatchCount);
+                        // Update match and next indices (logical indices)
+                        int newMatchIndex = prevLogIndex + entries.size();
+                        int newNextIndex = newMatchIndex + 1;
+                        matchIndex.put(peerId, newMatchIndex);
+                        nextIndex.put(peerId, newNextIndex);
                         updateCommitIndex();
                         applyCommittedEntries();
                     }
                 } else {
-                    nextIndex.put(peerId, Math.max(0, peerNextIndex - 1));
+                    // Decrement nextIndex but don't go below base index
+                    int baseIndex = getLogBaseIndex();
+                    nextIndex.put(peerId, Math.max(baseIndex, peerNextIndex - 1));
                 }
             } catch (Exception e) {
                 log.debug("Failed to send AppendEntries to {}: {}", peerId, e.getMessage());
@@ -398,46 +452,53 @@ public class RaftNode {
     }
     
     private void updateCommitIndex() {
+        if (state != NodeState.LEADER) {
+            return;
+        }
+        
+        // Collect match indices (logical indices) from all peers + self
+        // Note: matchIndex now includes the leader's own nodeId
         List<Integer> indices = new ArrayList<>(matchIndex.values());
-        indices.add(raftLog.size());  // COUNT-based: Leader has all entries
         Collections.sort(indices, Collections.reverseOrder());
         
-        int majorityIndex = (stubs.size() + 1) / 2;
-        if (majorityIndex < indices.size()) {
-            int newCommitCount = indices.get(majorityIndex);
+        // Find the majority index (median)
+        // Total nodes = stubs.size() (peers) + 1 (self)
+        // Majority position = totalNodes / 2 (0-indexed, so this gives us the median)
+        int totalNodes = stubs.size() + 1;
+        int majorityPosition = totalNodes / 2;
+        
+        if (majorityPosition < indices.size()) {
+            int newCommitIndex = indices.get(majorityPosition);
             
-            // commitIndex is COUNT-based: how many entries are committed
-            // newCommitCount > commitIndex means we can advance
-            // We need to verify the entry at index (newCommitCount - 1) is from current term
-            if (newCommitCount > commitIndex.get() &&
-                newCommitCount > 0 &&
-                newCommitCount <= raftLog.size() &&
-                raftLog.get(newCommitCount - 1).getTerm() == currentTerm.get()) {
-                commitIndex.set(newCommitCount);
-                log.debug("Updated commit index to {} (count)", newCommitCount);
+            // Only commit entries from current term (Raft safety requirement)
+            // Also skip if newCommitIndex is -1 (no entries replicated yet)
+            if (newCommitIndex >= 0 && newCommitIndex > commitIndex.get() && getLogTermAt(newCommitIndex) == currentTerm.get()) {
+                commitIndex.set(newCommitIndex);
+                log.debug("Updated commit index to {} (logical)", newCommitIndex);
                 applyCommittedEntries();
             }
         }
     }
     
     private void applyCommittedEntries() {
-        // lastApplied and commitIndex are COUNT-based (how many entries processed)
-        // Apply entries from index lastApplied to index (commitIndex - 1)
+        // Apply entries from lastApplied+1 to commitIndex (both logical indices)
         while (lastApplied.get() < commitIndex.get()) {
-            int indexToApply = lastApplied.get();  // Current lastApplied count = next index to apply
-            if (indexToApply < raftLog.size()) {
-                LogEntry entry = raftLog.get(indexToApply);
+            int logicalIndexToApply = lastApplied.get() + 1;
+            int physicalIndex = logicalToPhysical(logicalIndexToApply);
+            
+            if (physicalIndex >= 0 && physicalIndex < raftLog.size()) {
+                LogEntry entry = raftLog.get(physicalIndex);
                 
                 // Check if this is a configuration entry
                 if (entry.isConfigurationEntry()) {
-                    applyConfigurationEntry(entry, indexToApply);
+                    applyConfigurationEntry(entry, logicalIndexToApply);
                 } else if (entry.getCommand() != null) {
                     // Regular command entry (skip if command is null)
                     stateMachine.add(entry.getCommand());
-                    log.debug("Applied entry to state machine: {}", entry.getCommand());
+                    log.debug("Applied entry at logical index {} to state machine: {}", logicalIndexToApply, entry.getCommand());
                 }
             }
-            lastApplied.incrementAndGet();  // Increment count after applying
+            lastApplied.set(logicalIndexToApply);
         }
         
         // Check if we should create a snapshot
@@ -544,8 +605,8 @@ public class RaftNode {
             logEvent(RaftEvent.EventType.VOTE_DENIED, 
                 "Denied vote to " + request.getCandidateId() + " (stale term " + request.getTerm() + ")");
         } else if (votedFor == null || votedFor.equals(request.getCandidateId())) {
-            int lastLogIndex = raftLog.size() - 1;
-            int lastLogTerm = lastLogIndex >= 0 ? raftLog.get(lastLogIndex).getTerm() : 0;
+            int lastLogIndex = getLastLogIndex();
+            int lastLogTerm = getLogTermAt(lastLogIndex);
             
             boolean logUpToDate = request.getLastLogTerm() > lastLogTerm ||
                 (request.getLastLogTerm() == lastLogTerm && request.getLastLogIndex() >= lastLogIndex);
@@ -554,6 +615,10 @@ public class RaftNode {
                 votedFor = request.getCandidateId();
                 voteGranted = true;
                 lastHeartbeat = System.currentTimeMillis();
+                
+                // Persist vote (CRITICAL for Raft safety - must persist before responding)
+                persistenceService.saveState(config.getNodeId(), currentTerm.get(), votedFor);
+                
                 startElectionTimer();
                 log.info("Voted for {}", request.getCandidateId());
                 logEvent(RaftEvent.EventType.VOTE_GRANTED, 
@@ -608,9 +673,15 @@ public class RaftNode {
                 "Heartbeat from leader " + request.getLeaderId());
         }
         
-        if (request.getPrevLogIndex() >= 0) {
-            if (request.getPrevLogIndex() >= raftLog.size() ||
-                raftLog.get(request.getPrevLogIndex()).getTerm() != request.getPrevLogTerm()) {
+        // Check prevLogIndex/prevLogTerm consistency (logical indices)
+        int prevLogIndex = request.getPrevLogIndex();
+        if (prevLogIndex >= 0) {
+            // Check if we have the entry at prevLogIndex
+            int prevLogTerm = getLogTermAt(prevLogIndex);
+            
+            if (prevLogTerm == 0 || prevLogTerm != request.getPrevLogTerm()) {
+                log.debug("Log consistency check failed at index {}: expected term {}, got {}", 
+                         prevLogIndex, request.getPrevLogTerm(), prevLogTerm);
                 return AppendEntriesResponse.newBuilder()
                     .setTerm(currentTerm.get())
                     .setSuccess(false)
@@ -618,22 +689,45 @@ public class RaftNode {
             }
         }
         
-        int newEntryIndex = request.getPrevLogIndex() + 1;
+        // Process new entries (logical indices)
+        int newEntryLogicalIndex = prevLogIndex + 1;
         int entriesAdded = 0;
+        List<LogEntry> entriesToPersist = new ArrayList<>();
+        
         for (GrpcLogEntry entry : request.getEntriesList()) {
-            if (newEntryIndex < raftLog.size()) {
-                if (raftLog.get(newEntryIndex).getTerm() != entry.getTerm()) {
-                    raftLog.subList(newEntryIndex, raftLog.size()).clear();
+            int physicalIndex = logicalToPhysical(newEntryLogicalIndex);
+            
+            // Check for conflicts
+            if (physicalIndex >= 0 && physicalIndex < raftLog.size()) {
+                if (raftLog.get(physicalIndex).getTerm() != entry.getTerm()) {
+                    // Conflict detected - delete conflicting entries
+                    synchronized (raftLog) {
+                        raftLog.subList(physicalIndex, raftLog.size()).clear();
+                        
+                        // Persist log deletion (CRITICAL for consistency)
+                        persistenceService.deleteLogEntriesFrom(config.getNodeId(), newEntryLogicalIndex);
+                    }
                 }
             }
             
-            if (newEntryIndex >= raftLog.size()) {
+            // Append if we don't have this entry
+            physicalIndex = logicalToPhysical(newEntryLogicalIndex);
+            if (physicalIndex >= raftLog.size()) {
                 // Convert gRPC entry back to internal LogEntry
                 LogEntry logEntry = convertFromGrpcLogEntry(entry);
-                raftLog.add(logEntry);
+                synchronized (raftLog) {
+                    raftLog.add(logEntry);
+                }
+                entriesToPersist.add(logEntry);
                 entriesAdded++;
             }
-            newEntryIndex++;
+            newEntryLogicalIndex++;
+        }
+        
+        // Persist all new entries in batch (CRITICAL for durability)
+        if (!entriesToPersist.isEmpty()) {
+            int startLogicalIndex = prevLogIndex + 1;
+            persistenceService.appendLogEntries(config.getNodeId(), startLogicalIndex, entriesToPersist);
         }
         
         if (entriesAdded > 0) {
@@ -641,15 +735,16 @@ public class RaftNode {
                 "Replicated " + entriesAdded + " entries from leader " + request.getLeaderId());
         }
         
-        // Update commit index based on leader's commit index (COUNT-based)
+        // Update commit index based on leader's commit index (logical indices)
         if (request.getLeaderCommit() > commitIndex.get()) {
-            commitIndex.set(Math.min(request.getLeaderCommit(), raftLog.size()));
+            commitIndex.set(Math.min(request.getLeaderCommit(), getLastLogIndex()));
+            applyCommittedEntries();
         }
         
         return AppendEntriesResponse.newBuilder()
             .setTerm(currentTerm.get())
             .setSuccess(true)
-            .setMatchIndex(raftLog.size())  // COUNT-based: how many entries we have
+            .setMatchIndex(getLastLogIndex())  // Logical index of last entry
             .build();
     }
     
@@ -668,9 +763,17 @@ public class RaftNode {
         logEvent(RaftEvent.EventType.COMMAND_RECEIVED, 
             "Received command from client: " + command);
         
-        LogEntry entry =
-            new LogEntry(currentTerm.get(), command);
-        raftLog.add(entry);
+        LogEntry entry = new LogEntry(currentTerm.get(), command);
+        synchronized (raftLog) {
+            raftLog.add(entry);
+            
+            // Persist log entry (CRITICAL for durability)
+            int logicalIndex = getLastLogIndex();
+            persistenceService.appendLogEntry(config.getNodeId(), logicalIndex, entry);
+            
+            // Leader has this entry immediately replicated on itself
+            matchIndex.put(config.getNodeId(), logicalIndex);
+        }
         
         sendHeartbeats();
         
@@ -788,9 +891,14 @@ public class RaftNode {
         status.put("state", suspended ? "SUSPENDED" : state.name());
         status.put("currentTerm", currentTerm.get());
         status.put("currentLeader", currentLeader);
-        status.put("commitIndex", commitIndex.get());
-        status.put("lastApplied", lastApplied.get());
-        status.put("logSize", raftLog.size());
+        // Display commitIndex as COUNT of committed entries (not index)
+        // Internal: -1 = nothing committed, 0 = 1 entry committed, etc.
+        // Display: 0 = nothing committed, 1 = 1 entry committed, etc.
+        status.put("commitIndex", commitIndex.get() + 1);
+        status.put("lastApplied", lastApplied.get() + 1);
+        // Return logical log size: total entries including those in snapshot
+        int logicalLogSize = getLogBaseIndex() + raftLog.size();
+        status.put("logSize", logicalLogSize);
         status.put("stateMachine", new ArrayList<>(stateMachine));
         status.put("suspended", suspended);
         
@@ -925,8 +1033,8 @@ public class RaftNode {
         }
         
         try {
-            // Get the term of the last applied entry
-            int lastTerm = raftLog.get(lastIndex - 1).getTerm();
+            // Get the term of the last applied entry (lastIndex is logical)
+            int lastTerm = getLogTermAt(lastIndex);
             
             // Copy state machine state
             List<String> stateCopy = new ArrayList<>(stateMachine);
@@ -951,9 +1059,15 @@ public class RaftNode {
             lastSnapshot = snapshot;
             totalSnapshots.incrementAndGet();
             
+            // Persist snapshot (CRITICAL for recovery after compaction)
+            persistenceService.saveSnapshot(config.getNodeId(), snapshot);
+            
             // Compact the log: remove entries up to lastIndex
             int entriesRemoved = compactLog(lastIndex);
             compactedEntries.addAndGet(entriesRemoved);
+            
+            // Persist log compaction (delete old entries from database)
+            persistenceService.compactLog(config.getNodeId(), lastIndex);
             
             log.info("Created snapshot at index {} (term {}), compacted {} entries, size: {} bytes",
                 lastIndex, lastTerm, entriesRemoved, sizeBytes);
@@ -967,7 +1081,8 @@ public class RaftNode {
     }
     
     /**
-     * Compact the log by removing entries up to (but not including) the snapshot index.
+     * Compact the log by removing entries up to AND INCLUDING the snapshot index.
+     * After snapshot at index N, we only keep entries from index N+1 onwards.
      * Returns the number of entries removed.
      */
     private int compactLog(int snapshotIndex) {
@@ -975,8 +1090,16 @@ public class RaftNode {
             return 0;
         }
         
-        // Remove entries from 0 to snapshotIndex-1
-        int toRemove = Math.min(snapshotIndex, raftLog.size());
+        // Calculate how many entries to remove based on current baseIndex
+        
+        // If we don't have a snapshot yet, base is 0, so we remove entries 0..snapshotIndex (inclusive)
+        // If we already have a snapshot, we need to calculate physical positions
+        int physicalIndexOfSnapshot = logicalToPhysical(snapshotIndex);
+        
+        // Remove all entries up to and including the snapshot index
+        // After snapshot at index N, first entry should be at logical index N+1
+        int toRemove = physicalIndexOfSnapshot + 1;
+        toRemove = Math.max(0, Math.min(toRemove, raftLog.size()));
         
         synchronized (raftLog) {
             for (int i = 0; i < toRemove; i++) {
@@ -984,10 +1107,61 @@ public class RaftNode {
             }
         }
         
-        // Update indices (they're now relative to snapshot)
-        // Note: In a full implementation, you'd need to adjust all index references
-        
         return toRemove;
+    }
+    
+    /**
+     * Get the base index - the logical index of the first entry in raftLog.
+     * If we have a snapshot, baseIndex = lastIncludedIndex + 1
+     * Otherwise, baseIndex = 0
+     */
+    private int getLogBaseIndex() {
+        return lastSnapshot != null ? lastSnapshot.getLastIncludedIndex() + 1 : 0;
+    }
+    
+    /**
+     * Convert logical index to physical index in raftLog array.
+     * Logical index: absolute position (0, 1, 2, 3, ...)
+     * Physical index: position in raftLog array after compaction
+     * 
+     * Example: If snapshot at index 10, raftLog[0] is logically at index 11
+     */
+    private int logicalToPhysical(int logicalIndex) {
+        return logicalIndex - getLogBaseIndex();
+    }
+    
+    /**
+     * Convert physical index in raftLog array to logical index.
+     */
+    private int physicalToLogical(int physicalIndex) {
+        return physicalIndex + getLogBaseIndex();
+    }
+    
+    /**
+     * Get the last log index (logical).
+     */
+    private int getLastLogIndex() {
+        if (raftLog.isEmpty()) {
+            return lastSnapshot != null ? lastSnapshot.getLastIncludedIndex() : -1;
+        }
+        return physicalToLogical(raftLog.size() - 1);
+    }
+    
+    /**
+     * Get the term at a logical index.
+     * Returns 0 if index is before snapshot, or snapshot term if at snapshot boundary.
+     */
+    private int getLogTermAt(int logicalIndex) {
+        if (lastSnapshot != null && logicalIndex == lastSnapshot.getLastIncludedIndex()) {
+            return lastSnapshot.getLastIncludedTerm();
+        }
+        
+        int physicalIndex = logicalToPhysical(logicalIndex);
+        if (physicalIndex < 0 || physicalIndex >= raftLog.size()) {
+            return 0;
+        }
+        
+        return raftLog.get(physicalIndex).getTerm();
     }
     
     /**
@@ -1080,21 +1254,6 @@ public class RaftNode {
             String.format("Installed snapshot at index %d", snapshot.getLastIncludedIndex()));
     }
     
-    /**
-     * Get the base index for log entries (accounting for snapshot).
-     * This is the index of the last entry in the snapshot.
-     */
-    public int getLogBaseIndex() {
-        return lastSnapshot != null ? lastSnapshot.getLastIncludedIndex() : 0;
-    }
-    
-    /**
-     * Get the base term for log entries (accounting for snapshot).
-     */
-    public int getLogBaseTerm() {
-        return lastSnapshot != null ? lastSnapshot.getLastIncludedTerm() : 0;
-    }
-    
     // ==================== Advanced Raft Features ====================
     
     /**
@@ -1119,6 +1278,10 @@ public class RaftNode {
             currentTerm.set(request.getTerm());
             state = NodeState.FOLLOWER;
             votedFor = null;
+            
+            // Persist state change
+            persistenceService.saveState(config.getNodeId(), request.getTerm(), null);
+            
             logEvent(RaftEvent.EventType.TERM_INCREASED, 
                     "Term increased to " + request.getTerm() + " by InstallSnapshot from " + request.getLeaderId());
         }
@@ -1144,7 +1307,7 @@ public class RaftNode {
             
             @SuppressWarnings("unchecked")
             List<String> snapshotStateMachine = (List<String>) ois.readObject();
-            int snapshotTerm = ois.readInt();
+            ois.readInt(); // snapshotTerm - not used in current implementation
             
             // Calculate size for monitoring
             long sizeBytes = request.getData().size();
@@ -1186,6 +1349,10 @@ public class RaftNode {
             commitIndex.set(Math.max(commitIndex.get(), request.getLastIncludedIndex()));
             lastApplied.set(Math.max(lastApplied.get(), request.getLastIncludedIndex()));
             compactedEntries.addAndGet(request.getLastIncludedIndex());
+            
+            // Persist snapshot and compacted log (CRITICAL for recovery)
+            persistenceService.saveSnapshot(config.getNodeId(), snapshot);
+            persistenceService.compactLog(config.getNodeId(), request.getLastIncludedIndex());
             
             logEvent(RaftEvent.EventType.SNAPSHOT_INSTALLED, 
                     String.format("Installed snapshot from %s (index: %d, term: %d, size: %d entries)",
@@ -1249,6 +1416,10 @@ public class RaftNode {
                 currentTerm.set(response.getTerm());
                 state = NodeState.FOLLOWER;
                 votedFor = null;
+                
+                // Persist state change
+                persistenceService.saveState(config.getNodeId(), response.getTerm(), null);
+                
                 logEvent(RaftEvent.EventType.TERM_INCREASED, 
                         "Term increased to " + response.getTerm() + " by InstallSnapshot response from " + peerId);
                 return false;
@@ -1381,6 +1552,10 @@ public class RaftNode {
                     // Step down if higher term discovered
                     currentTerm.set(response.getTerm());
                     state = NodeState.FOLLOWER;
+                    
+                    // Persist state change
+                    persistenceService.saveState(config.getNodeId(), response.getTerm(), null);
+                    
                     return false;
                 }
                 
@@ -1418,6 +1593,72 @@ public class RaftNode {
         return lastLogIndex >= myLastIndex;
     }
     
+    // Getters
+    
+    public NodeState getState() {
+        return state;
+    }
+    
+    public AtomicInteger getCurrentTerm() {
+        return currentTerm;
+    }
+    
+    public String getVotedFor() {
+        return votedFor;
+    }
+    
+    public String getCurrentLeader() {
+        return currentLeader;
+    }
+    
+    public AtomicInteger getCommitIndex() {
+        return commitIndex;
+    }
+    
+    public AtomicInteger getLastApplied() {
+        return lastApplied;
+    }
+    
+    public List<LogEntry> getRaftLog() {
+        return raftLog;
+    }
+    
+    public List<String> getStateMachine() {
+        return stateMachine;
+    }
+    
+    public RaftConfig getConfig() {
+        return config;
+    }
+    
+    public Map<String, RaftServiceGrpc.RaftServiceBlockingStub> getStubs() {
+        return stubs;
+    }
+    
+    public Map<String, Integer> getNextIndex() {
+        return nextIndex;
+    }
+    
+    public Map<String, Integer> getMatchIndex() {
+        return matchIndex;
+    }
+    
+    public boolean isSuspended() {
+        return suspended;
+    }
+    
+    public Snapshot getLastSnapshot() {
+        return lastSnapshot;
+    }
+    
+    public AtomicInteger getCompactedEntries() {
+        return compactedEntries;
+    }
+    
+    public AtomicInteger getTotalSnapshots() {
+        return totalSnapshots;
+    }
+    
     // Setters for compatibility
     
     public void setState(NodeState newState) {
@@ -1426,6 +1667,8 @@ public class RaftNode {
     
     public void setVotedFor(String nodeId) {
         this.votedFor = nodeId;
+        // Persist state change
+        persistenceService.saveState(config.getNodeId(), currentTerm.get(), nodeId);
     }
     
     public void setCurrentLeader(String leaderId) {

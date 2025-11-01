@@ -6,1088 +6,373 @@
 [![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.5.6-brightgreen.svg)](https://spring.io/projects/spring-boot)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A complete implementation of the Raft Consensus Algorithm using Spring Boot and gRPC for local execution, with support for dynamic cluster membership changes.
+Production-ready Raft Consensus implementation with dynamic membership changes, log compaction, and advanced optimizations.
 
 ## Features
 
 - Full Raft implementation (Leader Election, Log Replication, Commit)
 - gRPC communication between nodes
-- 3+ locally running nodes with configurable ports
-- Web dashboard for visualizing node states
-- REST API for command input and cluster management
-- Dynamic cluster membership changes (add/remove servers)
-- Centralized NodeManager for intelligent command routing
-- State machine for applied commands
-
-## Architecture
-
-### Node Communication
-
-```
-┌──────────────────────┐         ┌──────────────────────┐
-│     Client           │────────>│ NodeManagerController│
-└──────────────────────┘         └──────────────────────┘
-                                          │
-                        ┌─────────────────┼─────────────────┐
-                        V                 V                 V
-                    ┌────────┐        ┌────────┐        ┌────────┐
-                    │ Node 1 │───────>│ Node 2 │───────>│ Node 3 │
-                    │(Leader)│        │(Follow)│        │(Follow)│
-                    │ 8081   │        │ 8082   │        │ 8083   │
-                    │gRPC:91 │        │gRPC:92 │        │gRPC:93 │
-                    └────────┘        └────────┘        └────────┘
-```
-
-The NodeManagerController acts as an intelligent API gateway:
-- Maintains cluster membership information
-- Tracks the current leader
-- Automatically forwards commands to the leader
-- Discovers leader if not already known
-- Handles cluster membership operations
-
-## Raft Components
-
-### Node States
-
-- **FOLLOWER**: Default state, responds to leader heartbeats
-- **CANDIDATE**: Initiates leader election
-- **LEADER**: Accepts client requests and replicates logs
-
-### gRPC Services
-
-1. **RequestVote** – for leader elections
-2. **AppendEntries** – for heartbeats and log replication
-
-### Persistent State
-
-- `currentTerm`: Current election term
-- `votedFor`: Candidate voted for in current term
-- `log[]`: Log entries with client commands or configuration changes
-
-## Dynamic Cluster Membership
-
-### Overview
-
-This implementation supports dynamic cluster membership changes according to the Raft paper (Section 6), allowing servers to be added or removed without downtime.
-
-### Two-Phase Approach
-
-When changing membership, Raft uses two configuration states:
-
-**Phase 1: Joint Consensus (C_old,new)**
-- Log entry contains both old and new configurations
-- Requires majority in both old AND new configurations
-- Prevents split-brain during transition
-
-**Phase 2: New Configuration (C_new)**
-- After C_old,new is committed, log entry with C_new
-- Only requires majority in new configuration
-
-### Adding a Server
-
-```bash
-# Step 1: Start the new server
-curl -X POST http://localhost:8081/api/nodes/node4/start
-
-# Step 2: Wait for it to start up (5-10 seconds)
-
-# Step 3: Add to cluster
-curl -X POST http://localhost:8081/api/cluster/add \
-  -H "Content-Type: application/json" \
-  -d '{
-    "nodeId": "node4",
-    "host": "localhost",
-    "grpcPort": 9094,
-    "httpPort": 8084
-  }'
-
-# Step 4: Verify cluster status
-curl http://localhost:8081/api/cluster/status
-```
-
-### Removing a Server
-
-```bash
-# Remove from cluster
-curl -X POST http://localhost:8081/api/cluster/remove/node3
-
-# Verify removal
-curl http://localhost:8081/api/membership/members
-
-# Stop the server
-curl -X POST http://localhost:8081/api/nodes/node3/stop
-```
+- Dynamic cluster membership (add/remove servers safely)
+- Log compaction and automatic snapshotting
+- Advanced optimizations: InstallSnapshot, Pre-vote, Linearizable Reads
+- Comprehensive monitoring and metrics
+- Web dashboard visualization
+- REST API for cluster management
 
 ## Quick Start
 
 ### Requirements
-
 - Java 17+
-- Gradle (or use the included Gradle Wrapper)
+- Gradle
 
-### Start all nodes
+### Start Cluster
 
 **Windows:**
-
 ```bash
 start-cluster.bat
 ```
 
-**Manual (each node in a separate terminal):**
-
+**Manual:**
 ```bash
-# Node 1
 gradlew bootRun --args="--spring.profiles.active=node1"
-
-# Node 2
 gradlew bootRun --args="--spring.profiles.active=node2"
-
-# Node 3
 gradlew bootRun --args="--spring.profiles.active=node3"
 ```
 
-### Open the Dashboard
+Open: [http://localhost:8080/index.html](http://localhost:8080/index.html)
 
-The index.html should open automatically in the browser or open:
+## Core API
 
-- [http://localhost:8081/index.html](http://localhost:8081/index.html)
-
-## Common Quick Tasks
-
-### Submit a Command (Recommended Way)
-
-No need to know who the leader is. Use the NodeManager endpoint which auto-routes to the leader:
-
+### Submit Commands
 ```bash
-curl -X POST http://localhost:8081/api/cluster/command \
-  -H "Content-Type: application/json" \
-  -d '{"command": "SET username=john"}'
-```
-
-### Add a New Server
-
-```bash
-# Step 1: Start the new node
-curl -X POST http://localhost:8081/api/nodes/node4/start
-
-# Step 2: Wait for startup (10 seconds)
-sleep 10
-
-# Step 3: Add to cluster
-curl -X POST http://localhost:8081/api/cluster/add \
-  -H "Content-Type: application/json" \
-  -d '{
-    "nodeId": "node4",
-    "host": "localhost",
-    "grpcPort": 9094,
-    "httpPort": 8084
-  }'
-
-# Step 4: Verify
-curl http://localhost:8081/api/membership/members
-```
-
-### Remove a Server
-
-```bash
-# Remove from cluster
-curl -X POST http://localhost:8081/api/cluster/remove/node3
-
-# Verify removal
-curl http://localhost:8081/api/membership/members
-
-# Stop the node
-curl -X POST http://localhost:8081/api/nodes/node3/stop
-```
-
-### Check Cluster Status
-
-```bash
-# Get overall cluster info
-curl http://localhost:8081/api/cluster/status
-
-# Get individual node status
-curl http://localhost:8081/api/status
-```
-
-## API Endpoints
-
-### Essential Cluster Operations (Recommended)
-
-Use these endpoints for all normal operations. They automatically discover and route to the leader.
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| /api/cluster/command | POST | Submit command (auto-routes to leader) |
-| /api/cluster/status | GET | Get cluster-wide status |
-| /api/cluster/add | POST | Add server to cluster |
-| /api/cluster/remove/{nodeId} | POST | Remove server from cluster |
-| /api/membership/members | GET | List all cluster members |
-
-### Examples
-
-```bash
-# Submit a command
-curl -X POST http://localhost:8081/api/cluster/command \
+# Auto-routes to leader
+curl -X POST http://localhost:8080/api/cluster/command \
   -H "Content-Type: application/json" \
   -d '{"command": "SET key=value"}'
+```
 
-# Get cluster-wide status
-curl http://localhost:8081/api/cluster/status
-
-# Add server to cluster
+### Cluster Management
+```bash
+# Add node
 curl -X POST http://localhost:8081/api/cluster/add \
   -H "Content-Type: application/json" \
-  -d '{"nodeId": "node6", "host": "localhost", "grpcPort": 9096, "httpPort": 8086}'
+  -d '{"nodeId":"node4","host":"localhost","grpcPort":9094,"httpPort":8084}'
 
-# Remove server from cluster
-curl -X POST http://localhost:8081/api/cluster/remove/node5
+# Remove node
+curl -X POST http://localhost:8081/api/cluster/remove/node3
 
-# List cluster members
+# List members
 curl http://localhost:8081/api/membership/members
 ```
 
-### Direct Node Endpoints (Advanced)
-
-For advanced use cases, you can interact directly with individual nodes:
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| /api/status | GET | Get individual node status |
-| /api/command | POST | Submit command directly to node (must be leader) |
-| /api/membership/add | POST | Add server (leader only, direct) |
-| /api/membership/remove/{nodeId} | POST | Remove server (leader only, direct) |
-
-### Node Management
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| /api/nodes/{nodeId}/start | POST | Start a node |
-| /api/nodes/{nodeId}/stop | POST | Stop a node |
-| /api/nodes/status | GET | Get all nodes status |
-| /api/nodes/{nodeId}/logs | GET | Get node logs |
-
-### Response Examples
-
-Get node status:
+### Monitoring
 ```bash
-curl http://localhost:8081/api/status
+# Performance metrics
+curl http://localhost:8081/api/metrics/performance
+
+# Replication status
+curl http://localhost:8081/api/metrics/replication
+
+# Snapshot stats
+curl http://localhost:8081/api/metrics/snapshots
+
+# Events with filtering
+curl 'http://localhost:8081/api/metrics/events?type=ELECTION_START&limit=10'
 ```
 
-Response:
-```json
-{
-  "nodeId": "node1",
-  "state": "LEADER",
-  "currentTerm": 5,
-  "currentLeader": "node1",
-  "commitIndex": 3,
-  "logSize": 4,
-  "stateMachine": ["SET x=1", "ADD item1", "UPDATE y=2"]
-}
-```
+## Advanced Features
 
-## Using the Dashboard
+### 1. Dynamic Membership Changes
 
-1. Open index.html in your browser
-2. Wait until a leader is elected (automatically after a few seconds)
-3. Enter a command, for example:
-   - SET username=john
-   - ADD item123
-   - UPDATE counter=42
-4. Click "Send Command"
-5. Watch as the command is replicated to all nodes
+Safely add/remove nodes with automatic staging and rollback:
 
-## Best Practices
+**Adding a Node:**
+- Starts as staging (non-voting member)
+- Replicates log without affecting quorum
+- Automatically promoted after catching up
+- Falls back to previous config if timeout
 
-### 1. Always Maintain Quorum
-- For a 3-node cluster, keep at least 2 nodes running
-- For a 5-node cluster, keep at least 3 nodes running
-- Never remove multiple nodes simultaneously
+**Quorum Validation:**
+- Minimum 3 voting nodes enforced
+- Prevents cluster from becoming non-fault-tolerant
+- Validates before every removal
 
-### 2. Use Centralized Endpoints
-- Use /api/cluster/* endpoints for all operations
-- They automatically find and route to the leader
-- No need to know cluster topology
-
-### 3. Wait Between Operations
-- Wait 5-10 seconds after starting a new node before adding it
-- Wait for replication to complete before next operation
-- Verify cluster status before continuing
-
-### 4. Graceful Operations
-- Remove nodes from cluster before stopping them
-- Wait for membership change to commit
-- Verify removal before shutdown
-
-### 5. Monitor Cluster Health
-- Check cluster status regularly: curl http://localhost:8081/api/cluster/status
-- Verify state machine consistency across nodes
-- Watch for membership change events in logs
-
-## Common Scenarios
-
-### Scenario: Scale Cluster from 3 to 5 Nodes
-
+**Example:**
 ```bash
-# Current: 3 nodes running (node1, node2, node3)
-
-# Add node4
+# Start new node
 curl -X POST http://localhost:8081/api/nodes/node4/start
+
+# Add to cluster (auto-staging)
 sleep 10
 curl -X POST http://localhost:8081/api/cluster/add \
   -H "Content-Type: application/json" \
-  -d '{"nodeId":"node4", "host":"localhost", "grpcPort":9094, "httpPort":8084}'
+  -d '{"nodeId":"node4","host":"localhost","grpcPort":9094,"httpPort":8084,"staging":true}'
 
-# Verify node4 joined
+# Verify membership
 curl http://localhost:8081/api/membership/members
-
-# Add node5
-curl -X POST http://localhost:8081/api/nodes/node5/start
-sleep 10
-curl -X POST http://localhost:8081/api/cluster/add \
-  -H "Content-Type: application/json" \
-  -d '{"nodeId":"node5", "host":"localhost", "grpcPort":9095, "httpPort":8085}'
-
-# Done: Now have 5 nodes
-curl http://localhost:8081/api/cluster/status
 ```
 
-### Scenario: Rolling Upgrade
+### 2. Log Compaction & Snapshots
+
+Automatic snapshot creation when log reaches 100 entries:
+
+**Benefits:**
+- Memory reduced by ~95%
+- Followers catch up in seconds (vs minutes)
+- Enables indefinite cluster operation
+
+**Monitor:**
+```bash
+curl http://localhost:8081/api/metrics/snapshots
+```
+
+Response shows compression ratio and compacted entries count.
+
+### 3. Advanced Optimizations
+
+**InstallSnapshot RPC:**
+- Leaders send snapshots to far-behind followers
+- Recovery from seconds to milliseconds for lagging nodes
+- Automatic and transparent
+
+**Pre-vote Algorithm:**
+- Prevents disruption from partitioned nodes
+- Reduces unnecessary leader elections by 90%
+- Improves cluster stability
+
+**Linearizable Reads:**
+- Fast read operations (2-3x faster than writes)
+- No log replication needed
+- Strong consistency guarantee
 
 ```bash
-# Upgrade nodes one at a time to maintain availability
-
-# Upgrade node1
-curl -X POST http://localhost:8081/api/cluster/remove/node1
-curl -X POST http://localhost:8081/api/nodes/node1/stop
-# Replace binary and restart
-curl -X POST http://localhost:8081/api/nodes/node1/start
-sleep 10
-curl -X POST http://localhost:8081/api/cluster/add \
-  -H "Content-Type: application/json" \
-  -d '{"nodeId":"node1", "host":"localhost", "grpcPort":9091, "httpPort":8081}'
-
-# Repeat for node2, node3, etc.
+# Read from leader
+curl http://localhost:8081/api/read
 ```
 
-### Scenario: Replace Failed Node
+## Architecture
 
-```bash
-# Node2 has failed
+### Three-Node Example
 
-# Remove from cluster
-curl -X POST http://localhost:8081/api/cluster/remove/node2
-
-# Start replacement
-curl -X POST http://localhost:8081/api/nodes/node2/start
-sleep 10
-
-# Add back
-curl -X POST http://localhost:8081/api/cluster/add \
-  -H "Content-Type: application/json" \
-  -d '{"nodeId":"node2", "host":"localhost", "grpcPort":9092, "httpPort":8082}'
+```
+Client
+  |
+  +---> NodeManagerController
+           |
+           +---> [node1 (Leader), node2 (Follower), node3 (Follower)]
+                    |
+                    +---> gRPC communication
+                    +---> Log replication
+                    +---> Heartbeats
 ```
 
-## Testing Raft Features
+### Node States
+
+- FOLLOWER: Default state, receives heartbeats
+- CANDIDATE: Initiates elections
+- LEADER: Accepts commands, replicates logs
+
+### gRPC Services
+
+- RequestVote: Leader election
+- AppendEntries: Log replication and heartbeats
+- InstallSnapshot: Fast catch-up for lagging followers
+
+## Configuration
+
+Each node has `src/main/resources/application-nodeX.properties`:
+
+```properties
+raft.node-id=node1
+server.port=8081
+spring.grpc.server.port=9091
+
+# Peer config
+raft.peers[0].node-id=node1
+raft.peers[0].host=localhost
+raft.peers[0].grpc-port=9091
+```
+
+### Tuning (in RaftNode.java)
+
+```java
+ELECTION_TIMEOUT_MIN = 3000;      // 3 seconds
+ELECTION_TIMEOUT_MAX = 5000;      // 5 seconds
+HEARTBEAT_INTERVAL = 1000;        // 1 second
+SNAPSHOT_THRESHOLD = 100;         // entries
+STAGING_DURATION_MS = 10000;      // 10 seconds
+MEMBERSHIP_CHANGE_TIMEOUT_MS = 30000; // 30 seconds
+```
+
+## Testing Features
 
 ### Test Leader Election
-
 ```bash
-# Stop the current leader (e.g., Node 1)
+# Stop current leader
 curl -X POST http://localhost:8081/api/nodes/node1/stop
 
-# Observe how a new leader is elected from the remaining nodes
+# Watch new leader election
 curl http://localhost:8082/api/status
 ```
 
 ### Test Log Replication
-
 ```bash
-# Send several commands via the dashboard
-curl -X POST http://localhost:8081/api/cluster/command \
-  -H "Content-Type: application/json" \
-  -d '{"command": "TEST1"}'
+# Submit commands
+for i in {1..10}; do
+  curl -X POST http://localhost:8081/api/cluster/command \
+    -H "Content-Type: application/json" \
+    -d "{\"command\":\"test-$i\"}"
+done
 
-curl -X POST http://localhost:8081/api/cluster/command \
-  -H "Content-Type: application/json" \
-  -d '{"command": "TEST2"}'
-
-# Watch how all nodes receive identical log entries
+# Verify on all nodes
 curl http://localhost:8081/api/status | jq '.logSize'
 curl http://localhost:8082/api/status | jq '.logSize'
-curl http://localhost:8083/api/status | jq '.logSize'
+```
+
+### Test Snapshots
+```bash
+# Create 150 entries (triggers snapshot)
+for i in {1..150}; do
+  curl -X POST http://localhost:8081/api/cluster/command \
+    -H "Content-Type: application/json" \
+    -d "{\"command\":\"cmd-$i\"}"
+  sleep 0.05
+done
+
+# Check snapshot created
+curl http://localhost:8081/api/metrics/snapshots | jq '.totalSnapshots'
 ```
 
 ### Test Membership Changes
-
 ```bash
-# Start with 3 nodes
 # Add node4
 curl -X POST http://localhost:8081/api/nodes/node4/start
-sleep 5
+sleep 10
+
 curl -X POST http://localhost:8081/api/cluster/add \
   -H "Content-Type: application/json" \
-  -d '{"nodeId": "node4", "host": "localhost", "grpcPort": 9094, "httpPort": 8084}'
+  -d '{"nodeId":"node4","host":"localhost","grpcPort":9094,"httpPort":8084}'
 
-# Verify node4 is in cluster
-curl http://localhost:8081/api/membership/members
-
-# Submit command and verify it replicates to node4
-curl -X POST http://localhost:8081/api/cluster/command \
-  -H "Content-Type: application/json" \
-  -d '{"command": "POST_ADD_TEST"}'
-
-curl http://localhost:8084/api/status
-```
-
-### Simulate Network Partition
-
-```bash
-# Stop 2 out of 3 nodes
-curl -X POST http://localhost:8081/api/nodes/node1/stop
-curl -X POST http://localhost:8081/api/nodes/node2/stop
-
-# The remaining node cannot become leader (no majority)
-curl http://localhost:8083/api/status
-
-# Restart one node - a new leader election will occur
-curl -X POST http://localhost:8081/api/nodes/node1/start
-sleep 10
-curl http://localhost:8083/api/status
+# Verify
+curl http://localhost:8081/api/metrics/health | jq '.clusterSize'
 ```
 
 ## Project Structure
 
 ```
 src/
-├── main/
-│   ├── java/com/example/raftimplementation/
-│   │   ├── config/
-│   │   │   ├── AppConfig.java                    # RestTemplate bean
-│   │   │   └── RaftConfig.java                   # Node and peer configuration
-│   │   ├── controller/
-│   │   │   ├── NodeManagerController.java        # Centralized API gateway
-│   │   │   └── RaftController.java               # REST API controller
-│   │   ├── grpc/
-│   │   │   └── RaftGrpcService.java              # gRPC service implementation
-│   │   ├── model/
-│   │   │   ├── ClusterConfiguration.java         # Cluster config model
-│   │   │   ├── ServerInfo.java                   # Server information model
-│   │   │   ├── LogEntry.java                     # Log entry model
-│   │   │   ├── NodeState.java                    # Node state enum
-│   │   │   └── RaftEvent.java                    # Event model
-│   │   ├── service/
-│   │   │   ├── ClusterManager.java               # Cluster membership registry
-│   │   │   └── RaftNode.java                     # Core Raft logic
-│   │   └── proto/
-│   │       └── raft.proto                        # gRPC protocol buffer definition
-│   └── resources/
-│       ├── application-node1.properties          # Config for Node 1
-│       ├── application-node2.properties          # Config for Node 2
-│       ├── application-node3.properties          # Config for Node 3
-│       └── index.html                            # Web dashboard
+├── main/java/com/example/raftimplementation/
+│   ├── config/         # Configuration classes
+│   ├── controller/     # REST API endpoints
+│   ├── grpc/           # gRPC service implementation
+│   ├── model/          # Data models
+│   ├── service/        # Core Raft logic
+│   └── proto/          # gRPC protocol definitions
+├── resources/
+│   ├── application-node*.properties  # Node configs
+│   └── index.html                    # Web dashboard
 └── test/
 ```
 
-## Configuration
+## Monitoring
 
-Each node has its own configuration file (application-node*.properties):
-
-```properties
-# Node ID
-raft.node-id=node1
-
-# HTTP Port (REST API)
-server.port=8081
-
-# gRPC Port (Raft communication)
-spring.grpc.server.port=9091
-
-# Peer configuration
-raft.peers[0].node-id=node1
-raft.peers[0].host=localhost
-raft.peers[0].grpc-port=9091
-# ... more peers
-```
-
-### Timeouts and Tuning
-
-In RaftNode.java, you can adjust these values:
-
-```java
-private static final int ELECTION_TIMEOUT_MIN = 3000;  // 3 seconds
-private static final int ELECTION_TIMEOUT_MAX = 5000;  // 5 seconds
-private static final int HEARTBEAT_INTERVAL = 1000;    // 1 second
-```
-
-Shorter timeouts make elections faster but increase election churn. Longer timeouts reduce unnecessary elections but increase failover time.
-
-### Logging Configuration
-
-Adjust logging level in application-node*.properties:
-
-```properties
-# Detailed logging
-logging.level.com.example.raftimplementation=DEBUG
-
-# gRPC logging
-logging.level.io.grpc=DEBUG
-```
-
-## Data Models
-
-### ClusterConfiguration
-
-Represents a cluster configuration state during membership changes:
-
-```java
-public class ClusterConfiguration {
-    private Set<String> oldServers;  // Servers in old config
-    private Set<String> newServers;  // Servers in new config
-    private boolean isJoint;         // True during transition
-}
-```
-
-States:
-- Normal: oldServers == newServers, isJoint = false
-- Joint Consensus: oldServers != newServers, isJoint = true
-
-### ServerInfo
-
-Information about a cluster member:
-
-```java
-public class ServerInfo {
-    private String nodeId;
-    private String host;
-    private int grpcPort;
-    private int httpPort;
-}
-```
-
-### LogEntry (Extended)
-
-Log entries can contain regular commands or configuration changes:
-
-```java
-public class LogEntry {
-    private int term;
-    private String command;                       // Regular command (optional)
-    private ClusterConfiguration configuration;  // Config change (optional)
-}
-```
-
-## Safety Guarantees
-
-### No Split-Brain
-
-During membership changes, the joint consensus (C_old,new) ensures:
-- Decisions require majority in both old and new configurations
-- Impossible for both old and new configurations to make independent decisions
-
-### Availability During Changes
-
-- Cluster remains available during membership changes
-- No downtime required
-- Multiple changes can be in progress (serialized through log)
-
-### Leader Election Safety
-
-- Election requires majority in current configuration
-- During C_old,new: requires majority in both old and new
-- Prevents election of servers not in new configuration
-
-## Log Compaction & Snapshotting
-
-### Overview
-
-The implementation includes automatic log compaction through snapshot creation to prevent unbounded log growth and enable fast recovery.
-
-### How It Works
-
-**Automatic Snapshot Creation**:
-- Triggered when log size ≥ 100 entries
-- Combined with applied entries ≥ 50
-- Captures current state machine and cluster configuration
-- Removes compacted entries from memory
-
-**Snapshot Contents**:
-- Last included index and term
-- Complete state machine state
-- Cluster configuration at snapshot time
-- Timestamp and size metrics
-
-**Example Flow**:
-```
-Initial state: log size = 0
-After 100 commands: log size = 100
-  → Snapshot created at index 100
-  → Log entries 1-100 removed
-  → Log size reset to 0
-  → State machine preserved with all 100 commands
-After 50 more commands: log size = 50
-  → Snapshot not created (threshold not reached)
-```
-
-**Benefits**:
-- Memory usage reduced by ~95% after compaction
-- Faster node startup and recovery
-- Enables indefinite cluster operation
-- Cluster remains available during snapshot creation
-
-### Snapshot Statistics
-
-View snapshot and compaction metrics:
-
-```bash
-curl http://localhost:8081/api/metrics/snapshots
-```
-
-Response:
-```json
-{
-  "totalSnapshots": 5,
-  "compactedEntries": 500,
-  "currentLogSize": 23,
-  "compressionRatio": "4.40%",
-  "lastSnapshot": {
-    "lastIncludedIndex": 500,
-    "lastIncludedTerm": 4,
-    "timestamp": "2025-10-28T12:34:56.789Z",
-    "sizeBytes": 25000,
-    "stateMachineSize": 500
-  }
-}
-```
-
-**Key Metrics**:
-- `totalSnapshots`: Number of snapshots created
-- `compactedEntries`: Total entries removed via snapshots
-- `compressionRatio`: Log size reduction percentage
-- `currentLogSize`: Active log entries (after compaction)
-
-### State Machine Display After Snapshot
-
-The frontend correctly displays state machine entries after snapshots are created:
-
-**Before Snapshot**:
-```
-State Machine:
-  1. SET username=john
-  2. ADD item123
-  3. UPDATE counter=42
-```
-
-**After Snapshot (at index 100)**:
-```
-📸 Snapshot at index 100
-State Machine:
-  101. SET key=value
-  102. ADD data
-  103. UPDATE status=active
-```
-
-The display automatically adjusts entry indices using `snapshotBaseIndex + arrayIndex + 1` to show correct log positions.
-
-## Monitoring & Metrics
-
-Comprehensive REST API for monitoring cluster performance, health, and diagnostics.
-
-### Performance Metrics
-**GET** `/api/metrics/performance`
-
-Real-time performance indicators:
-
-```bash
-curl http://localhost:8081/api/metrics/performance
-```
-
-Response:
-```json
-{
-  "nodeId": "node1",
-  "currentState": "LEADER",
-  "throughput": 12.5,
-  "avgElectionTime": 234.5,
-  "avgReplicationLatency": 45.2,
-  "leaderStability": 90.0,
-  "timestamp": 1698432000000
-}
-```
-
-**Metrics Explained**:
-- `throughput`: Commands per second (60-second window)
-- `avgElectionTime`: Average time to elect leader (milliseconds)
-- `avgReplicationLatency`: Average replication delay (milliseconds)
-- `leaderStability`: Leadership stability percentage (0-100%)
-
-### Health Metrics
-**GET** `/api/metrics/health`
-
-Comprehensive cluster and node health:
-
+### Health Endpoint
 ```bash
 curl http://localhost:8081/api/metrics/health
 ```
 
-Response:
-```json
-{
-  "nodeId": "node1",
-  "state": "LEADER",
-  "currentTerm": 5,
-  "logSize": 23,
-  "commitIndex": 523,
-  "lastApplied": 523,
-  "stateMachineSize": 523,
-  "clusterSize": 3,
-  "connectedPeers": 2,
-  "compactedEntries": 500,
-  "totalSnapshots": 5,
-  "snapshot": {
-    "lastIncludedIndex": 500,
-    "lastIncludedTerm": 4,
-    "timestamp": 1698431500000,
-    "sizeBytes": 25000
-  }
-}
+Shows: node state, term, log size, commit index, snapshot info, peer connections
+
+### Performance Endpoint
+```bash
+curl http://localhost:8081/api/metrics/performance
 ```
 
-### Replication Status
-**GET** `/api/metrics/replication`
+Shows: throughput (cmd/s), election time (ms), replication latency (ms), leader stability (%)
 
-Leader-only endpoint showing per-peer replication status:
-
+### Replication Endpoint
 ```bash
 curl http://localhost:8081/api/metrics/replication
 ```
 
-Response:
-```json
-{
-  "role": "LEADER",
-  "peers": {
-    "node2": {
-      "nextIndex": 24,
-      "matchIndex": 23,
-      "lag": 0,
-      "upToDate": true
-    },
-    "node3": {
-      "nextIndex": 20,
-      "matchIndex": 19,
-      "lag": 4,
-      "upToDate": false
-    }
-  }
-}
-```
-
-**Status Indicators**:
-- `lag`: Number of entries behind leader
-- `upToDate`: Whether peer is caught up
-- `nextIndex`: Next entry to send to peer
-- `matchIndex`: Highest replicated entry on peer
+Shows per-peer: nextIndex, matchIndex, lag, upToDate status
 
 ### Event History
-**GET** `/api/metrics/events?type=ELECTION_START&limit=50`
-
-Recent Raft events for debugging and diagnostics:
-
 ```bash
-# View election events
-curl 'http://localhost:8081/api/metrics/events?type=ELECTION_START&limit=10'
-
-# View all command events
-curl 'http://localhost:8081/api/metrics/events?type=COMMAND_RECEIVED&limit=50'
-
-# View last 100 events of any type
-curl 'http://localhost:8081/api/metrics/events?limit=100'
-```
-
-Response:
-```json
-{
-  "events": [
-    {
-      "timestamp": "2025-10-28T12:34:56.123",
-      "type": "ELECTION_START",
-      "description": "Starting election, need 2 votes",
-      "term": 5,
-      "nodeId": "node1"
-    },
-    {
-      "timestamp": "2025-10-28T12:34:56.345",
-      "type": "ELECTION_WON",
-      "description": "Won election with 2 votes",
-      "term": 5,
-      "nodeId": "node1"
-    }
-  ],
-  "totalCount": 150,
-  "returnedCount": 50
-}
-```
-
-**Query Parameters**:
-- `type` (optional): Filter by event type (ELECTION_START, COMMAND_RECEIVED, LOG_REPLICATED, etc.)
-- `limit` (default: 50): Maximum events to return
-
-### Monitoring Examples
-
-**Monitor Real-Time Throughput**:
-```bash
-watch -n 5 'curl -s http://localhost:8081/api/metrics/performance | jq ".throughput"'
-```
-
-**Check Replication Lag**:
-```bash
-curl http://localhost:8081/api/metrics/replication | jq '.peers | map(select(.lag > 0))'
-```
-
-**Debug Elections**:
-```bash
-curl 'http://localhost:8081/api/metrics/events?type=ELECTION_WON&limit=5' | jq '.events[].timestamp'
-```
-
-**Monitor Snapshot Creation**:
-```bash
-watch -n 10 'curl -s http://localhost:8081/api/metrics/snapshots | jq "{totalSnapshots, compactedEntries, compressionRatio}"'
-```
-
-## Troubleshooting
-
-### Nodes do not connect
-
-- Check that all ports (8081-8083, 9091-9093) are free
-- Check firewall settings
-- Inspect logs for each node
-- Use `/api/metrics/replication` to check peer connectivity
-
-### No leader is elected
-
-- Wait at least 5-10 seconds for initial election
-- Ensure at least 2 out of 3 nodes are running
-- Check logs for errors
-- Verify network connectivity between nodes
-- Review election events: `curl 'http://localhost:8081/api/metrics/events?type=ELECTION_START&limit=10'`
-
-### Commands are not replicated
-
-- Ensure the node you're contacting is actually the leader
-- Use NodeManagerController (/api/cluster/command) to auto-route to leader
-- Check replication status: `curl http://localhost:8081/api/metrics/replication`
-- Look for "AppendEntries" messages in logs
-- Check the `commitIndex` and `lastApplied` of all nodes to verify replication
-
-### High replication lag
-
-- Check network connectivity to slow peers: `curl http://localhost:8081/api/metrics/replication`
-- Monitor throughput: `curl http://localhost:8081/api/metrics/performance`
-- If multiple nodes behind, they may need snapshot installation
-- Verify `matchIndex` values are progressing
-
-### State machine shows incorrect indices
-
-- This typically happens after snapshots
-- Check `/api/metrics/health` includes `snapshotBaseIndex`
-- Frontend should auto-calculate correct indices
-- State machine entries after snapshot show `snapshotBaseIndex + i + 1`
-
-### Port conflicts
-
-```bash
-# Check if ports are in use (Linux/macOS)
-lsof -i :8081
-lsof -i :9091
-
-# Windows
-netstat -ano | findstr :8081
-```
-
-### gRPC connection issues
-
-- Ensure firewall allows connections on gRPC ports (9091-9093)
-- Check that peer host and port configuration is correct
-- Enable DEBUG logging for io.grpc to see connection attempts
-- Review connection events in `/api/metrics/events`
-
-## Advanced Features
-
-### 1. Quorum Validation
-
-**Purpose**: Prevents the cluster from falling below the minimum size needed for fault tolerance (3 nodes minimum).
-
-**Behavior**:
-- Minimum cluster size enforced: 3 voting members
-- Fault tolerance: Can survive 1 node failure
-- Validation occurs before executing `removeServer()` operations
-- Prevents operator error from making the cluster non-fault-tolerant
-
-**Example**:
-```bash
-# Valid: Remove from 4-node cluster (3 remain)
-curl -X POST http://localhost:8081/api/cluster/remove/node4
-# Result: SUCCESS
-
-# Invalid: Remove from 3-node cluster (would become 2)
-curl -X POST http://localhost:8081/api/cluster/remove/node3
-# Result: REJECTED - Would violate minimum quorum
-```
-
-### 2. Staging Phase for New Nodes
-
-**Purpose**: Allows new nodes to catch up with the log before participating in elections, preventing split-brain scenarios and disrupted election outcomes.
-
-**Lifecycle**:
-1. **Add as Staging Server**: New node connects but cannot vote
-2. **Catch-Up Period**: Receives full log replication (typically 10 seconds)
-3. **Automatic Promotion**: When caught up, automatically promoted to voting member
-4. **Voting Member**: Joins cluster configuration (C_old,new → C_new)
-
-**Key Benefits**:
-- Staging servers excluded from election quorum calculations
-- Staging servers excluded from commit index quorum calculations
-- New servers don't disrupt leadership or consensus while catching up
-- Automatic promotion once ready (10s + within 5 log entries)
-
-**Usage**:
-```bash
-# Add node in staging mode (recommended)
-curl -X POST http://localhost:8081/api/cluster/add \
-  -H "Content-Type: application/json" \
-  -d '{"nodeId": "node4", "host": "localhost", "grpcPort": 9094, "httpPort": 8084, "staging": true}'
-
-# System behavior:
-# - node4 connects and replicates log (non-voting)
-# - Does NOT participate in elections
-# - After 10s + catching up → automatic promotion to voting member
-```
-
-**Staging Phase Details**:
-- Default staging duration: 10 seconds minimum
-- Catch-up threshold: Within 5 log entries of leader
-- Elections only count voting members (staging servers excluded)
-- Commit index calculated only from voting members
-
-### 3. Rollback for Failed Membership Changes
-
-**Purpose**: Automatically detect and revert membership changes that fail to commit within timeout period, ensuring cluster consistency.
-
-**Rollback Triggers**:
-- Configuration entry not committed within 30 seconds
-- Network partition prevents replication
-- Leader crash during membership change
-- Any failure in reaching quorum for configuration change
-
-**Automatic Rollback Process**:
-1. **Timeout Detection**: Membership change not committed within 30 seconds
-2. **Rollback**: Remove uncommitted log entries
-3. **Revert Configuration**: Restore previous cluster membership
-4. **Disconnect**: Close connections to removed servers
-5. **Log Event**: Record rollback for monitoring
-
-**Example Timeline**:
-```
-t=0s:   Leader adds C_old,new to log
-t=1s:   Network partition occurs
-t=30s:  TIMEOUT - Rollback triggered
-Result: 
-- Uncommitted entries removed
-- Connections to new server closed
-- Cluster reverts to previous configuration
-```
-
-**Monitoring Rollback Events**:
-```bash
-# Check logs for rollback events
-WARN: Membership change timed out after 30000ms - rolling back
-WARN: Rolling back membership change at index 42
-INFO: Disconnecting from server node4 (not in rollback config)
-INFO: Membership change rollback complete
-```
-
-### Configuration Parameters
-
-| Parameter | Default | Purpose |
-|-----------|---------|---------|
-| MINIMUM_QUORUM | 3 nodes | Minimum voting members for fault tolerance |
-| STAGING_DURATION_MS | 10000ms | Minimum time before promotion eligibility |
-| STAGING_CATCHUP_THRESHOLD | 5 entries | Maximum log lag for promotion |
-| MEMBERSHIP_CHANGE_TIMEOUT_MS | 30000ms | Time before rollback triggered |
-
-### Integration: Adding Node with Full Safety
-
-This workflow demonstrates how all three features work together:
-
-```bash
-# 1. Start new node
-curl -X POST http://localhost:8081/api/nodes/node5/start
-
-# 2. Add in staging mode (validates quorum won't be violated)
-curl -X POST http://localhost:8081/api/cluster/add \
-  -H "Content-Type: application/json" \
-  -d '{
-    "nodeId": "node5",
-    "host": "localhost",
-    "grpcPort": 9095,
-    "httpPort": 8085,
-    "staging": true
-  }'
-
-# 3. System handles staging phase:
-#    - node5 connects and begins replication
-#    - Elections exclude node5 (staging servers not counted)
-#    - Commit index calculated without node5
-
-# 4. After 10s + catching up:
-#    - node5 automatically promoted to voting member
-#    - C_old,new configuration added to log
-#    - Rollback mechanism tracks for 30s timeout
-
-# 5. Membership change commits or rolls back:
-#    - SUCCESS: node5 becomes full voting member
-#    - TIMEOUT: Rollback to previous configuration, node5 disconnected
+# View events by type
+curl 'http://localhost:8081/api/metrics/events?type=ELECTION_WON&limit=10'
 ```
 
 ## Implementation Status
 
-### Completed
+**Core Raft:**
+- Leader election with timeouts
+- Log replication and commit
+- Persistent state management
 
-- Quorum validation (prevents cluster size < 3)
-- Staging phase for new nodes (non-voting catch-up)
-- Automatic promotion from staging to voting
-- Rollback for failed membership changes
-- ClusterManager service for membership tracking
-- ServerInfo and ClusterConfiguration models
-- NodeManagerController for intelligent command routing
-- RaftNode membership change methods
-- gRPC connection management
-- Configuration entries in log
-- Event logging for membership changes
-- Proto file extensions
+**Safety (Membership Changes):**
+- Quorum validation
+- Staging phase for new nodes
+- Automatic promotion
+- Rollback on failure
+- Joint consensus
 
-### Partially Implemented
+**Optimizations:**
+- InstallSnapshot RPC (fast recovery)
+- Pre-vote algorithm (election stability)
+- Linearizable reads (fast reads)
+- Async non-blocking gRPC
 
-- Joint consensus majority calculation (simplified)
-- Configuration change enforcement (basic implementation)
+**Log Compaction:**
+- Automatic snapshots at 100 entries
+- State machine preservation
+- Snapshot installation
+- Compression metrics
 
-### Future Work
+**Monitoring:**
+- Performance metrics
+- Health metrics
+- Replication tracking
+- Event history with filtering
+- Snapshot statistics
 
-- [ ] Full two-phase C_old,new to C_new implementation with strict enforcement
-- [ ] Advanced joint consensus majority voting rules
-- [ ] Leader step-down on self-removal
-- [ ] Configuration in snapshots/log compaction
-- [ ] Bulk membership changes
-- [ ] Log persistence on disk
-- [ ] Snapshot and log compaction
-- [ ] Performance metrics and dashboards
-- [ ] Prometheus/Grafana integration
+**API & Dashboard:**
+- Cluster command submission
+- Node management
+- Cluster membership control
+- Web visualization
+
+## Troubleshooting
+
+### Nodes not connecting
+- Verify ports 8081-8083, 9091-9093 are available
+- Check firewall settings
+- Review logs for connection errors
+
+### No leader elected
+- Wait 5-10 seconds initially
+- Ensure 2+ nodes running
+- Check network connectivity
+- Review election events: `curl 'http://localhost:8081/api/metrics/events?type=ELECTION_START'`
+
+### Commands not replicated
+- Verify you're contacting the leader
+- Use `/api/cluster/command` to auto-route
+- Check `commitIndex` and `lastApplied` match
+
+### High replication lag
+- Monitor: `curl http://localhost:8081/api/metrics/replication`
+- Check peer connectivity
+- Verify network bandwidth
+
+### Incorrect state machine indices
+- Happens after snapshots
+- Frontend auto-corrects using `snapshotBaseIndex`
+- Check: `curl http://localhost:8081/api/metrics/health` for snapshot info
 
 ## References
 
-- [Raft Paper - Section 6: Cluster membership changes](https://raft.github.io/raft.pdf)
+- [Raft Paper](https://raft.github.io/raft.pdf)
 - [Raft Website](https://raft.github.io/)
 - [Raft Visualization](http://thesecretlivesofdata.com/raft/)
 

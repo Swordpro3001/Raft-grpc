@@ -9,14 +9,20 @@ import com.example.raftimplementation.grpc.VoteResponse;
 import com.example.raftimplementation.model.LogEntry;
 import com.example.raftimplementation.model.NodeState;
 import com.example.raftimplementation.model.RaftEvent;
+import com.example.raftimplementation.persistence.RaftPersistenceService;
+import com.example.raftimplementation.persistence.RaftStateEntity;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
 
 /**
  * Unit tests for RaftNode class.
@@ -31,6 +37,7 @@ class RaftNodeTest {
 
     private RaftNode raftNode;
     private RaftConfig config;
+    private RaftPersistenceService persistenceService;
 
     @BeforeEach
     void setUp() {
@@ -55,7 +62,21 @@ class RaftNodeTest {
         peers.add(peer3);
         config.setPeers(peers);
         
-        raftNode = new RaftNode(config);
+        // Mock persistence service
+        persistenceService = Mockito.mock(RaftPersistenceService.class);
+        
+        // Setup default behavior for persistence service
+        RaftStateEntity defaultState = new RaftStateEntity();
+        defaultState.setNodeId("node1");
+        defaultState.setCurrentTerm(0);
+        defaultState.setVotedFor(null);
+        defaultState.setLastUpdated(System.currentTimeMillis());
+        
+        when(persistenceService.loadState(anyString())).thenReturn(defaultState);
+        when(persistenceService.loadLog(anyString())).thenReturn(new ArrayList<>());
+        when(persistenceService.loadSnapshot(anyString())).thenReturn(Optional.empty());
+        
+        raftNode = new RaftNode(config, persistenceService);
     }
 
     @Test
@@ -63,8 +84,8 @@ class RaftNodeTest {
         assertEquals(NodeState.FOLLOWER, raftNode.getState());
         assertEquals(0, raftNode.getCurrentTerm().get());
         assertNull(raftNode.getVotedFor());
-        assertEquals(0, raftNode.getCommitIndex().get());
-        assertEquals(0, raftNode.getLastApplied().get());
+        assertEquals(-1, raftNode.getCommitIndex().get());  // -1 = no entries committed yet
+        assertEquals(-1, raftNode.getLastApplied().get());  // -1 = no entries applied yet
         assertTrue(raftNode.getStateMachine().isEmpty());
         assertTrue(raftNode.getRaftLog().isEmpty());
     }
