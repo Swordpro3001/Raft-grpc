@@ -43,7 +43,7 @@ public class LogEntryEntity {
     /**
      * Command to be applied to state machine.
      */
-    @Column(nullable = false, length = 1000)
+    @Column(nullable = true, length = 1000)
     private String command;
     
     /**
