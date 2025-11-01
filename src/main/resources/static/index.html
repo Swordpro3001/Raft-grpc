@@ -1331,8 +1331,8 @@
                                 ? '<div class="state-machine-empty">Keine Commands ausgeführt</div>'
                                 : status.stateMachine.map((cmd, i) => {
                                     // State machine contains ALL applied entries (including those in snapshot)
-                                    // Display as 1-indexed (i+1)
-                                    const actualIndex = i + 1;
+                                    // Display as 1-indexed, offset by snapshotBaseIndex
+                                    const actualIndex = (status.snapshotBaseIndex || 0) + i + 1;
                                     return `<div class="state-machine-item">${actualIndex}. ${cmd}</div>`;
                                 }).join('')
                             }
