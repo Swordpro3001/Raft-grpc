@@ -5,6 +5,73 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Raft Cluster Dashboard</title>
     <style>
+        .user-info {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: white;
+            padding: 15px 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            z-index: 1000;
+        }
+
+        .user-info-content {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+        }
+
+        .user-name {
+            font-weight: bold;
+            color: #333;
+        }
+
+        .user-role {
+            font-size: 0.85em;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-weight: bold;
+            margin-top: 3px;
+        }
+
+        .role-ADMIN {
+            background: #e3f2fd;
+            color: #1976d2;
+        }
+
+        .role-USER {
+            background: #f3e5f5;
+            color: #7b1fa2;
+        }
+
+        .logout-button {
+            background: #f44336;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 0.9em;
+            transition: all 0.3s;
+        }
+
+        .logout-button:hover {
+            background: #d32f2f;
+        }
+
+        .admin-only {
+            /* Will be hidden for USER role */
+            display: inherit;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+        
         * {
             margin: 0;
             padding: 0;
@@ -654,6 +721,15 @@
     </style>
 </head>
 <body>
+    <!-- User Info Panel -->
+    <div class="user-info">
+        <div class="user-info-content">
+            <div class="user-name" id="userName">Loading...</div>
+            <div class="user-role" id="userRole"></div>
+        </div>
+        <button class="logout-button" onclick="logout()">Logout</button>
+    </div>
+
     <div class="container">
         <h1>Raft Cluster Dashboard</h1>
         
@@ -728,7 +804,7 @@
             </div>
         </div>
         
-        <div class="command-section">
+        <div class="command-section admin-only">
             <h2>Cluster Management</h2>
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
                 <div>
@@ -780,6 +856,82 @@
     </div>
     
     <script>
+        // ==================== AUTHENTICATION ====================
+        let currentUser = null;
+        let jwtToken = null;
+
+        // Check authentication on page load
+        function checkAuth() {
+            jwtToken = localStorage.getItem('jwtToken');
+            const username = localStorage.getItem('username');
+            const roles = JSON.parse(localStorage.getItem('roles') || '[]');
+
+            if (!jwtToken || !username) {
+                // Redirect to login
+                window.location.href = '/login.html';
+                return false;
+            }
+
+            currentUser = { username, roles };
+            
+            // Update UI
+            document.getElementById('userName').textContent = username;
+            const roleElement = document.getElementById('userRole');
+            
+            const isAdmin = roles.includes('ROLE_ADMIN');
+            const roleClass = isAdmin ? 'role-ADMIN' : 'role-USER';
+            const roleText = isAdmin ? 'ADMIN' : 'USER';
+            
+            roleElement.className = `user-role ${roleClass}`;
+            roleElement.textContent = roleText;
+
+            // Hide admin-only elements for USER role
+            if (!isAdmin) {
+                document.querySelectorAll('.admin-only').forEach(el => {
+                    el.classList.add('hidden');
+                });
+            }
+
+            return true;
+        }
+
+        // Add JWT token to fetch requests
+        function authFetch(url, options = {}) {
+            if (!jwtToken) {
+                window.location.href = '/login.html';
+                return Promise.reject(new Error('No authentication token'));
+            }
+
+            options.headers = {
+                ...options.headers,
+                'Authorization': `Bearer ${jwtToken}`
+            };
+
+            return fetch(url, options).then(response => {
+                if (response.status === 401 || response.status === 403) {
+                    // Token expired or invalid
+                    logout();
+                    throw new Error('Authentication failed');
+                }
+                return response;
+            });
+        }
+
+        // Logout function
+        function logout() {
+            localStorage.removeItem('jwtToken');
+            localStorage.removeItem('username');
+            localStorage.removeItem('roles');
+            window.location.href = '/login.html';
+        }
+
+        // Check auth before doing anything
+        if (!checkAuth()) {
+            // Don't execute rest of script if not authenticated
+            throw new Error('Not authenticated');
+        }
+
+        // ==================== EXISTING CODE ====================
         const nodes = [
             { id: 'node1', port: 8081 },
             { id: 'node2', port: 8082 },
@@ -861,7 +1013,7 @@
             try {
                 // Send command through the management node (backward compatible API)
                 // Management node will forward to the current leader
-                const response = await fetch(`http://localhost:8080/api/command`, {
+                const response = await authFetch(`http://localhost:8080/api/command`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ command })
@@ -898,7 +1050,7 @@
             
             try {
                 // Send linearizable read request through the client proxy
-                const response = await fetch(`http://localhost:8080/api/read`, {
+                const response = await authFetch(`http://localhost:8080/api/read`, {
                     method: 'GET',
                     headers: { 'Accept': 'application/json' }
                 });
@@ -1051,7 +1203,7 @@
         
         async function suspendNode(nodeId) {
             try {
-                const response = await fetch(`http://localhost:8080/api/nodes/${nodeId}/suspend`, {
+                const response = await authFetch(`http://localhost:8080/api/nodes/${nodeId}/suspend`, {
                     method: 'POST'
                 });
                 const data = await response.json();
@@ -1069,7 +1221,7 @@
         
         async function resumeNode(nodeId) {
             try {
-                const response = await fetch(`http://localhost:8080/api/nodes/${nodeId}/resume`, {
+                const response = await authFetch(`http://localhost:8080/api/nodes/${nodeId}/resume`, {
                     method: 'POST'
                 });
                 const data = await response.json();
@@ -1335,7 +1487,7 @@
             
             try {
                 // Fetch all node statuses (backward compatible with old /api/nodes)
-                const response = await fetch('http://localhost:8080/api/nodes');
+                const response = await authFetch('http://localhost:8080/api/nodes');
                 const statuses = await response.json();
                 
                 // Update each node card individually (only if changed)
@@ -1362,7 +1514,7 @@
             
             try {
                 // Fetch performance metrics
-                const perfResponse = await fetch(`http://localhost:${managerPort}/api/metrics/performance`);
+                const perfResponse = await authFetch(`http://localhost:8080/api/metrics/performance`);
                 if (perfResponse.ok) {
                     const perfData = await perfResponse.json();
                     
@@ -1377,7 +1529,7 @@
                 }
                 
                 // Fetch snapshot statistics
-                const snapResponse = await fetch(`http://localhost:${managerPort}/api/metrics/snapshots`);
+                const snapResponse = await authFetch(`http://localhost:8080/api/metrics/snapshots`);
                 if (snapResponse.ok) {
                     const snapData = await snapResponse.json();
                     
@@ -1395,7 +1547,7 @@
                 }
                 
                 // Fetch replication status
-                const replResponse = await fetch(`http://localhost:${managerPort}/api/metrics/replication`);
+                const replResponse = await authFetch(`http://localhost:8080/api/metrics/replication`);
                 if (replResponse.ok) {
                     const replData = await replResponse.json();
                     updateReplicationStatus(replData);
@@ -1469,7 +1621,7 @@
         async function createSnapshot() {
             try {
                 // Create snapshot via management node (uses backward compatible API)
-                const response = await fetch(`http://localhost:8080/api/snapshot/create`, {
+                const response = await authFetch(`http://localhost:8080/api/snapshot/create`, {
                     method: 'POST'
                 });
                 const data = await response.json();
@@ -1512,6 +1664,7 @@
         });
         
         // Make functions global
+        window.logout = logout;
         window.startNode = startNode;
         window.stopNode = stopNode;
         window.suspendNode = suspendNode;
