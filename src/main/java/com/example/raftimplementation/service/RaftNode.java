@@ -899,7 +899,9 @@ public class RaftNode {
         // Return logical log size: total entries including those in snapshot
         int logicalLogSize = getLogBaseIndex() + raftLog.size();
         status.put("logSize", logicalLogSize);
-        status.put("stateMachine", new ArrayList<>(stateMachine));
+        synchronized (stateMachine) {
+            status.put("stateMachine", new ArrayList<>(stateMachine));
+        }
         status.put("suspended", suspended);
         
         // Add snapshot information for correct state machine indexing
