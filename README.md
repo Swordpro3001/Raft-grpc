@@ -22,11 +22,11 @@ Production-ready Raft Consensus implementation with dynamic membership changes, 
 ## Quick Start
 
 ### Requirements
-- Java 17+
-- Gradle
+- Java 21+
+- Gradle (or use the included Gradle Wrapper)
+
 
 ### Start Cluster
-
 **Windows:**
 ```bash
 start-cluster.bat
