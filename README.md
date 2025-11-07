@@ -60,7 +60,7 @@ A complete implementation of the Raft Consensus Algorithm using Spring Boot and 
 
 ### Requirements
 
-* Java 17+
+* Java 21
 * Gradle (or use the included Gradle Wrapper)
 
 ### Start all nodes
