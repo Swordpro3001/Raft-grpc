@@ -1,6 +1,7 @@
 package com.example.raftimplementation.service;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
 
 import java.io.BufferedReader;
@@ -13,6 +14,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Service
+@ConditionalOnProperty(name = "raft.node.enabled", havingValue = "true", matchIfMissing = true)
 @Slf4j
 public class NodeManagerService {
     

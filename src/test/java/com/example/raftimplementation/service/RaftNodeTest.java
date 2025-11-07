@@ -1,16 +1,28 @@
 package com.example.raftimplementation.service;
 
 import com.example.raftimplementation.config.RaftConfig;
-import com.example.raftimplementation.grpc.*;
+import com.example.raftimplementation.grpc.AppendEntriesRequest;
+import com.example.raftimplementation.grpc.AppendEntriesResponse;
+import com.example.raftimplementation.grpc.GrpcLogEntry;
+import com.example.raftimplementation.grpc.VoteRequest;
+import com.example.raftimplementation.grpc.VoteResponse;
 import com.example.raftimplementation.model.LogEntry;
 import com.example.raftimplementation.model.NodeState;
 import com.example.raftimplementation.model.RaftEvent;
+import com.example.raftimplementation.persistence.RaftPersistenceService;
+import com.example.raftimplementation.persistence.RaftStateEntity;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
 
 /**
  * Unit tests for RaftNode class.
@@ -25,6 +37,7 @@ class RaftNodeTest {
 
     private RaftNode raftNode;
     private RaftConfig config;
+    private RaftPersistenceService persistenceService;
 
     @BeforeEach
     void setUp() {
@@ -49,7 +62,21 @@ class RaftNodeTest {
         peers.add(peer3);
         config.setPeers(peers);
         
-        raftNode = new RaftNode(config);
+        // Mock persistence service
+        persistenceService = Mockito.mock(RaftPersistenceService.class);
+        
+        // Setup default behavior for persistence service
+        RaftStateEntity defaultState = new RaftStateEntity();
+        defaultState.setNodeId("node1");
+        defaultState.setCurrentTerm(0);
+        defaultState.setVotedFor(null);
+        defaultState.setLastUpdated(System.currentTimeMillis());
+        
+        when(persistenceService.loadState(anyString())).thenReturn(defaultState);
+        when(persistenceService.loadLog(anyString())).thenReturn(new ArrayList<>());
+        when(persistenceService.loadSnapshot(anyString())).thenReturn(Optional.empty());
+        
+        raftNode = new RaftNode(config, persistenceService);
     }
 
     @Test
@@ -57,8 +84,8 @@ class RaftNodeTest {
         assertEquals(NodeState.FOLLOWER, raftNode.getState());
         assertEquals(0, raftNode.getCurrentTerm().get());
         assertNull(raftNode.getVotedFor());
-        assertEquals(-1, raftNode.getCommitIndex().get());
-        assertEquals(-1, raftNode.getLastApplied().get());
+        assertEquals(-1, raftNode.getCommitIndex().get());  // -1 = no entries committed yet
+        assertEquals(-1, raftNode.getLastApplied().get());  // -1 = no entries applied yet
         assertTrue(raftNode.getStateMachine().isEmpty());
         assertTrue(raftNode.getRaftLog().isEmpty());
     }
@@ -117,8 +144,8 @@ class RaftNodeTest {
 
     @Test
     void testHandleAppendEntries() {
-        com.example.raftimplementation.grpc.LogEntry entry = 
-            com.example.raftimplementation.grpc.LogEntry.newBuilder()
+        GrpcLogEntry entry = 
+            GrpcLogEntry.newBuilder()
                 .setTerm(1)
                 .setCommand("SET x=1")
                 .build();
@@ -142,8 +169,8 @@ class RaftNodeTest {
     @Test
     void testHandleAppendEntriesWithCommit() {
         // Add entry
-        com.example.raftimplementation.grpc.LogEntry entry = 
-            com.example.raftimplementation.grpc.LogEntry.newBuilder()
+        GrpcLogEntry entry = 
+            GrpcLogEntry.newBuilder()
                 .setTerm(1)
                 .setCommand("FIRST_COMMAND")
                 .build();
@@ -264,8 +291,8 @@ class RaftNodeTest {
     void testMultipleLogEntries() {
         // Add multiple entries
         for (int i = 0; i < 5; i++) {
-            com.example.raftimplementation.grpc.LogEntry entry = 
-                com.example.raftimplementation.grpc.LogEntry.newBuilder()
+            GrpcLogEntry entry = 
+                GrpcLogEntry.newBuilder()
                     .setTerm(1)
                     .setCommand("CMD_" + i)
                     .build();
@@ -292,8 +319,8 @@ class RaftNodeTest {
     @Test
     void testCommitIndexNeverDecreases() {
         // Add and commit some entries
-        com.example.raftimplementation.grpc.LogEntry entry = 
-            com.example.raftimplementation.grpc.LogEntry.newBuilder()
+        GrpcLogEntry entry = 
+            GrpcLogEntry.newBuilder()
                 .setTerm(1)
                 .setCommand("CMD")
                 .build();
@@ -322,8 +349,8 @@ class RaftNodeTest {
         assertTrue(raftNode.getLastApplied().get() <= raftNode.getCommitIndex().get());
         
         // Add and commit entry
-        com.example.raftimplementation.grpc.LogEntry entry = 
-            com.example.raftimplementation.grpc.LogEntry.newBuilder()
+        GrpcLogEntry entry = 
+            GrpcLogEntry.newBuilder()
                 .setTerm(1)
                 .setCommand("CMD")
                 .build();
@@ -361,8 +388,8 @@ class RaftNodeTest {
 
     @Test
     void testLogEntryStructure() {
-        com.example.raftimplementation.grpc.LogEntry entry = 
-            com.example.raftimplementation.grpc.LogEntry.newBuilder()
+        GrpcLogEntry entry = 
+            GrpcLogEntry.newBuilder()
                 .setTerm(3)
                 .setCommand("TEST_COMMAND")
                 .build();
