@@ -105,6 +105,48 @@
             border: 1px solid #f5c6cb;
         }
         
+        .read-result {
+            background: #e3f2fd;
+            border: 2px solid #2196f3;
+            border-radius: 8px;
+            padding: 15px;
+            margin-top: 15px;
+            color: #0d47a1;
+        }
+        
+        .read-result h3 {
+            margin: 0 0 10px 0;
+            color: #1565c0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .read-result .linearizable-badge {
+            background: #4caf50;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.85em;
+        }
+        
+        .read-result .state-machine-list {
+            max-height: 300px;
+            overflow-y: auto;
+            background: white;
+            border-radius: 4px;
+            padding: 10px;
+        }
+        
+        .read-result .state-machine-item {
+            padding: 5px;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        
+        .read-result .state-machine-item:last-child {
+            border-bottom: none;
+        }
+        
         .nodes-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
@@ -160,7 +202,32 @@
             background: #c82333;
         }
         
-        .btn-start:disabled, .btn-stop:disabled {
+        .btn-suspend {
+            background: #ffc107;
+            color: #000;
+        }
+        
+        .btn-suspend:hover {
+            background: #e0a800;
+        }
+        
+        .btn-resume {
+            background: #17a2b8;
+        }
+        
+        .btn-resume:hover {
+            background: #138496;
+        }
+        
+        .btn-remove {
+            background: #6c757d;
+        }
+        
+        .btn-remove:hover {
+            background: #5a6268;
+        }
+        
+        .btn-start:disabled, .btn-stop:disabled, .btn-suspend:disabled, .btn-resume:disabled {
             background: #6c757d;
             cursor: not-allowed;
             transform: none;
@@ -197,6 +264,11 @@
         
         .state-CANDIDATE {
             background: #fff3cd;
+            color: #856404;
+        }
+        
+        .state-SUSPENDED {
+            background: #ffc107;
             color: #856404;
         }
         
@@ -252,6 +324,17 @@
             color: #999;
             text-align: center;
             padding: 20px;
+        }
+        
+        .snapshot-indicator {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 8px 12px;
+            border-radius: 5px;
+            margin-bottom: 10px;
+            font-size: 0.9em;
+            font-weight: bold;
+            text-align: center;
         }
         
         .node-event-log {
@@ -416,23 +499,278 @@
         .updating {
             animation: pulse 1s infinite;
         }
+        
+        /* Monitoring Dashboard Styles */
+        .monitoring-dashboard {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 30px;
+        }
+        
+        .monitoring-dashboard h2 {
+            color: #667eea;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .metric-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            border-radius: 10px;
+            color: white;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+        }
+        
+        .metric-label {
+            font-size: 0.9em;
+            opacity: 0.9;
+            margin-bottom: 8px;
+        }
+        
+        .metric-value {
+            font-size: 2em;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        
+        .metric-unit {
+            font-size: 0.8em;
+            opacity: 0.8;
+        }
+        
+        .snapshot-info {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 15px;
+            margin-top: 15px;
+        }
+        
+        .snapshot-info h3 {
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 1.1em;
+        }
+        
+        .snapshot-stat {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        
+        .snapshot-stat:last-child {
+            border-bottom: none;
+        }
+        
+        .replication-status {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 15px;
+            margin-top: 15px;
+        }
+        
+        .replication-status h3 {
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 1.1em;
+        }
+        
+        .peer-status {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px;
+            background: white;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            border-left: 4px solid #667eea;
+        }
+        
+        .peer-status.up-to-date {
+            border-left-color: #28a745;
+        }
+        
+        .peer-status.lagging {
+            border-left-color: #ffc107;
+        }
+        
+        .peer-name {
+            font-weight: bold;
+            color: #333;
+        }
+        
+        .peer-info {
+            display: flex;
+            gap: 15px;
+            font-size: 0.9em;
+        }
+        
+        .peer-lag {
+            color: #666;
+        }
+        
+        .lag-badge {
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 0.85em;
+            font-weight: bold;
+        }
+        
+        .lag-badge.good {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        .lag-badge.warning {
+            background: #fff3cd;
+            color: #856404;
+        }
+        
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: #e0e0e0;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 10px;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            transition: width 0.3s ease;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Raft Cluster Dashboard</h1>
         
+        <!-- Monitoring Dashboard -->
+        <div class="monitoring-dashboard">
+            <h2>📊 Cluster Performance Metrics</h2>
+            
+            <div class="metrics-grid">
+                <div class="metric-card">
+                    <div class="metric-label">Throughput</div>
+                    <div class="metric-value" id="metric-throughput">-</div>
+                    <div class="metric-unit">commands/sec</div>
+                </div>
+                
+                <div class="metric-card">
+                    <div class="metric-label">Leader Stability</div>
+                    <div class="metric-value" id="metric-stability">-</div>
+                    <div class="metric-unit">%</div>
+                </div>
+                
+                <div class="metric-card">
+                    <div class="metric-label">Avg Election Time</div>
+                    <div class="metric-value" id="metric-election">-</div>
+                    <div class="metric-unit">ms</div>
+                </div>
+                
+                <div class="metric-card">
+                    <div class="metric-label">Avg Replication Latency</div>
+                    <div class="metric-value" id="metric-latency">-</div>
+                    <div class="metric-unit">ms</div>
+                </div>
+            </div>
+            
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                <div class="snapshot-info">
+                    <h3>Snapshot Statistics</h3>
+                    <div id="snapshotStats">
+                        <div class="snapshot-stat">
+                            <span>Total Snapshots:</span>
+                            <strong id="snap-total">-</strong>
+                        </div>
+                        <div class="snapshot-stat">
+                            <span>Compacted Entries:</span>
+                            <strong id="snap-compacted">-</strong>
+                        </div>
+                        <div class="snapshot-stat">
+                            <span>Current Log Size:</span>
+                            <strong id="snap-logsize">-</strong>
+                        </div>
+                        <div class="snapshot-stat">
+                            <span>Compression Ratio:</span>
+                            <strong id="snap-ratio">-</strong>
+                        </div>
+                        <div class="snapshot-stat">
+                            <span>Last Snapshot Index:</span>
+                            <strong id="snap-index">-</strong>
+                        </div>
+                    </div>
+                    <button onclick="createSnapshot()" style="margin-top: 10px; width: 100%;">
+                        Create Snapshot
+                    </button>
+                </div>
+                
+                <div class="replication-status">
+                    <h3>Replication Status</h3>
+                    <div id="replicationStatus">
+                        <p style="color: #666; text-align: center; padding: 20px;">
+                            No leader or data available
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="command-section">
+            <h2>Cluster Management</h2>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                <div>
+                    <h3 style="color: #667eea; margin-bottom: 10px;">Add Node to Cluster</h3>
+                    <div style="background: #fff3cd; padding: 12px; border-radius: 8px; margin-bottom: 10px; border-left: 4px solid #ffc107;">
+                        <strong>Wichtig:</strong> Nach dem Hinzufügen muss der Node <strong>manuell gestartet</strong> werden!<br>
+                        <small>Siehe <code>README.md</code> für Details.</small>
+                    </div>
+                    <div style="display: flex; flex-direction: column; gap: 8px;">
+                        <input type="text" id="newNodeId" placeholder="Node ID (z.B. node6)">
+                        <input type="text" id="newNodeHost" placeholder="Host (z.B. localhost)" value="localhost">
+                        <input type="text" id="newNodeGrpcPort" placeholder="gRPC Port (z.B. 50056)">
+                        <input type="text" id="newNodeHttpPort" placeholder="HTTP Port (z.B. 8086)">
+                        <button onclick="addNode()">+ Add Node</button>
+                        <small style="color: #666; font-size: 12px;">
+                            Start command: <code>.\start-node.bat [nodeId] [httpPort] [grpcPort]</code>
+                        </small>
+                    </div>
+                </div>
+                <div>
+                    <h3 style="color: #667eea; margin-bottom: 10px;">Cluster Info</h3>
+                    <div id="clusterInfo" style="background: #f8f9fa; padding: 15px; border-radius: 8px; font-family: monospace; font-size: 14px;">
+                        Loading...
+                    </div>
+                </div>
+            </div>
+            <div id="clusterMessage" class="message"></div>
+        </div>
+        
         <div class="command-section">
             <h2>Command eingeben</h2>
             <div class="input-group">
                 <input type="text" id="commandInput" placeholder="z.B. SET key=value oder ADD item">
                 <button onclick="submitCommand()">Command senden</button>
+                <button onclick="linearizableRead()">Linearizable Read</button>
                 <button onclick="refreshStatus()">Status aktualisieren</button>
             </div>
             <div id="commandMessage" class="message"></div>
+            <div id="readResult" class="read-result" style="display: none;"></div>
         </div>
-        
-        <h2 style="color: white; margin-bottom: 15px; text-align: center;">📊 Cluster Nodes</h2>
+
+        <h2 style="color: white; margin-bottom: 15px; text-align: center;">Cluster Nodes</h2>
         
         <div id="nodesContainer" class="nodes-grid"></div>
         
@@ -479,6 +817,28 @@
             return null; // No node available
         }
         
+        async function findLeaderNode() {
+            // Try to find the current leader
+            for (const node of nodes) {
+                try {
+                    const response = await fetch(`http://localhost:${node.port}/api/status`, {
+                        method: 'GET',
+                        signal: AbortSignal.timeout(2000) // 2 second timeout
+                    });
+                    if (response.ok) {
+                        const data = await response.json();
+                        if (data.state === 'LEADER') {
+                            console.log(`Found leader: ${node.id} (port ${node.port})`);
+                            return node.port;
+                        }
+                    }
+                } catch (error) {
+                    // Node not available, try next
+                }
+            }
+            return null; // No leader found
+        }
+        
         function formatTimestamp(timestamp) {
             const date = new Date(timestamp);
             return date.toLocaleTimeString('de-DE', { 
@@ -498,37 +858,26 @@
                 return;
             }
             
-            let success = false;
-            let responseMsg = '';
-            
-            for (const node of nodes) {
-                try {
-                    const response = await fetch(`http://localhost:${node.port}/api/command`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ command })
-                    });
-                    
-                    const data = await response.json();
-                    
-                    if (data.success) {
-                        success = true;
-                        responseMsg = `✓ Command erfolgreich an ${node.id} (Leader) gesendet`;
-                        break;
-                    } else {
-                        responseMsg = data.message || 'Command fehlgeschlagen';
-                    }
-                } catch (error) {
-                    console.log(`Node ${node.id} nicht erreichbar`);
+            try {
+                // Always send command through the client proxy (port 8080)
+                // The proxy will automatically find an available leader
+                const response = await fetch(`http://localhost:8080/api/command`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showMessage(`✓ Command erfolgreich verarbeitet`, 'success');
+                    input.value = '';
+                    setTimeout(refreshStatus, 500);
+                } else {
+                    showMessage(`✗ ${data.message}`, 'error');
                 }
-            }
-            
-            if (success) {
-                showMessage(responseMsg, 'success');
-                input.value = '';
-                setTimeout(refreshStatus, 500);
-            } else {
-                showMessage(responseMsg || 'Kein Leader gefunden. Warte auf Leader-Election...', 'error');
+            } catch (error) {
+                showMessage(`✗ Fehler beim Senden des Commands: ${error.message}`, 'error');
             }
         }
         
@@ -541,6 +890,60 @@
             setTimeout(() => {
                 message.style.display = 'none';
             }, 5000);
+        }
+        
+        async function linearizableRead() {
+            const readResult = document.getElementById('readResult');
+            const message = document.getElementById('commandMessage');
+            
+            try {
+                // Send linearizable read request through the client proxy
+                const response = await fetch(`http://localhost:8080/api/read`, {
+                    method: 'GET',
+                    headers: { 'Accept': 'application/json' }
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    // Display the read result
+                    const stateMachine = data.stateMachine || [];
+                    const isLinearizable = data.linearizable === true;
+                    const leader = data.leader || 'Unknown';
+                    
+                    readResult.innerHTML = `
+                        <h3>
+                            🔒 Read Result from Leader
+                            ${isLinearizable 
+                                ? '<span class="linearizable-badge">✓ Linearizable</span>'
+                                : '<span class="linearizable-badge" style="background: #2196f3;">Fast Read</span>'
+                            }
+                        </h3>
+                        <p><strong>Read from:</strong> ${leader}</p>
+                        <p><strong>Total entries:</strong> ${stateMachine.length}</p>
+                        <div class="state-machine-list">
+                            ${stateMachine.length === 0 
+                                ? '<div style="text-align: center; padding: 20px; color: #666;">No entries in state machine</div>'
+                                : stateMachine.map((cmd, i) => 
+                                    `<div class="state-machine-item">${i + 1}. ${cmd}</div>`
+                                ).join('')
+                            }
+                        </div>
+                    `;
+                    readResult.style.display = 'block';
+                    
+                    // Hide the result after 10 seconds
+                    setTimeout(() => {
+                        readResult.style.display = 'none';
+                    }, 10000);
+                } else {
+                    showMessage(`✗ ${data.message || 'Failed to perform read'}`, 'error');
+                    readResult.style.display = 'none';
+                }
+            } catch (error) {
+                showMessage(`✗ Error performing read: ${error.message}`, 'error');
+                readResult.style.display = 'none';
+            }
         }
         
         async function fetchNodeStatus(node) {
@@ -568,9 +971,12 @@
                     currentTerm: 0,
                     currentLeader: null,
                     commitIndex: 0,
+                    lastApplied: 0,
                     logSize: 0,
                     stateMachine: [],
                     events: [],
+                    snapshotBaseIndex: 0,
+                    hasSnapshot: false,
                     error: true
                 };
             }
@@ -643,6 +1049,169 @@
             }
         }
         
+        async function suspendNode(nodeId) {
+            const managerPort = await findAvailableManagerNode();
+            
+            if (!managerPort) {
+                showMessage(`✗ Kein Node verfügbar für Management-Operationen`, 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`http://localhost:${managerPort}/api/nodes/${nodeId}/suspend`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                if (data.success) {
+                    showMessage(`✓ ${nodeId} wurde suspendiert`, 'success');
+                    setTimeout(refreshStatus, 500);
+                } else {
+                    showMessage(`✗ ${data.message}`, 'error');
+                }
+            } catch (error) {
+                showMessage(`✗ Fehler beim Suspendieren von ${nodeId}: ${error.message}`, 'error');
+            }
+        }
+        
+        async function resumeNode(nodeId) {
+            const managerPort = await findAvailableManagerNode();
+            
+            if (!managerPort) {
+                showMessage(`✗ Kein Node verfügbar für Management-Operationen`, 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`http://localhost:${managerPort}/api/nodes/${nodeId}/resume`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                if (data.success) {
+                    showMessage(`✓ ${nodeId} wurde wiederaufgenommen`, 'success');
+                    setTimeout(refreshStatus, 500);
+                } else {
+                    showMessage(`✗ ${data.message}`, 'error');
+                }
+            } catch (error) {
+                showMessage(`✗ Fehler beim Wiederaufnehmen von ${nodeId}: ${error.message}`, 'error');
+            }
+        }
+        
+        async function addNode() {
+            const nodeId = document.getElementById('newNodeId').value.trim();
+            const host = document.getElementById('newNodeHost').value.trim();
+            const grpcPort = document.getElementById('newNodeGrpcPort').value.trim();
+            const httpPort = document.getElementById('newNodeHttpPort').value.trim();
+            
+            if (!nodeId || !host || !grpcPort || !httpPort) {
+                showClusterMessage('Bitte alle Felder ausfüllen', 'error');
+                return;
+            }
+            
+            const managerPort = await findAvailableManagerNode();
+            
+            if (!managerPort) {
+                showClusterMessage(`✗ Kein Node verfügbar für Management-Operationen`, 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`http://localhost:${managerPort}/api/cluster/add`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        nodeId: nodeId,
+                        host: host,
+                        grpcPort: parseInt(grpcPort),
+                        httpPort: parseInt(httpPort)
+                    })
+                });
+                const data = await response.json();
+                
+                if (data.success) {
+                    showClusterMessage(
+                        `✓ ${nodeId} wurde zum Cluster hinzugefügt!\n\n` +
+                        `⚠️ WICHTIG: Starte den Node jetzt manuell:\n` +
+                        `.\\start-node.bat ${nodeId} ${httpPort} ${grpcPort}\n\n` +
+                        `Oder: .\\gradlew.bat bootRun --args=--spring.profiles.active=${nodeId}`,
+                        'success'
+                    );
+                    // Clear form
+                    document.getElementById('newNodeId').value = '';
+                    document.getElementById('newNodeGrpcPort').value = '';
+                    document.getElementById('newNodeHttpPort').value = '';
+                    
+                    // Add to nodes array for monitoring
+                    if (!nodes.find(n => n.id === nodeId)) {
+                        nodes.push({ id: nodeId, port: parseInt(httpPort) });
+                    }
+                    
+                    setTimeout(refreshStatus, 1000);
+                } else {
+                    showClusterMessage(`✗ ${data.message}`, 'error');
+                }
+            } catch (error) {
+                showClusterMessage(`✗ Fehler beim Hinzufügen von ${nodeId}: ${error.message}`, 'error');
+            }
+        }
+        
+        async function removeNode(nodeId) {
+            const confirmed = confirm(
+                `⚠️ Node ${nodeId} aus dem Cluster entfernen?\n\n` +
+                'Dies wird den Node dauerhaft aus dem Raft-Cluster entfernen.\n' +
+                'Der Prozess läuft weiter, nimmt aber nicht mehr teil.\n\n' +
+                'Fortfahren?'
+            );
+            
+            if (!confirmed) {
+                return;
+            }
+            
+            const managerPort = await findAvailableManagerNode();
+            
+            if (!managerPort) {
+                showMessage(`✗ Kein Node verfügbar für Management-Operationen`, 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`http://localhost:${managerPort}/api/cluster/remove/${nodeId}`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                if (data.success) {
+                    showMessage(`✓ ${nodeId} wurde aus dem Cluster entfernt`, 'success');
+                    
+                    // Remove from nodes array
+                    const index = nodes.findIndex(n => n.id === nodeId);
+                    if (index !== -1) {
+                        nodes.splice(index, 1);
+                    }
+                    
+                    setTimeout(refreshStatus, 1000);
+                } else {
+                    showMessage(`✗ ${data.message}`, 'error');
+                }
+            } catch (error) {
+                showMessage(`✗ Fehler beim Entfernen von ${nodeId}: ${error.message}`, 'error');
+            }
+        }
+        
+        function showClusterMessage(text, type) {
+            const message = document.getElementById('clusterMessage');
+            message.style.whiteSpace = 'pre-wrap'; // Preserve line breaks
+            message.textContent = text;
+            message.className = `message ${type}`;
+            message.style.display = 'block';
+            
+            setTimeout(() => {
+                message.style.display = 'none';
+            }, 15000); // Show longer for important instructions
+        }
+        
         function hasStateChanged(nodeId, newStatus) {
             const prev = previousStates[nodeId];
             if (!prev) return true; // First time
@@ -652,9 +1221,12 @@
                    prev.currentTerm !== newStatus.currentTerm ||
                    prev.currentLeader !== newStatus.currentLeader ||
                    prev.commitIndex !== newStatus.commitIndex ||
+                   prev.lastApplied !== newStatus.lastApplied ||
                    prev.logSize !== newStatus.logSize ||
                    prev.stateMachine.length !== newStatus.stateMachine.length ||
                    prev.events.length !== newStatus.events.length ||
+                   prev.hasSnapshot !== newStatus.hasSnapshot ||
+                   prev.snapshotBaseIndex !== newStatus.snapshotBaseIndex ||
                    prev.error !== newStatus.error;
         }
         
@@ -680,6 +1252,7 @@
         
         function renderNodeContent(status) {
             const isOffline = status.error || status.state === 'OFFLINE';
+            const isSuspended = status.state === 'SUSPENDED' || status.suspended;
             const nodeRunning = !isOffline;
             const events = status.events || [];
             
@@ -699,8 +1272,14 @@
                         <button class="btn-start" onclick="startNode('${status.nodeId}')" ${nodeRunning ? 'disabled' : ''}>
                             ▶ Start
                         </button>
-                        <button class="btn-stop" onclick="stopNode('${status.nodeId}')" ${!nodeRunning ? 'disabled' : ''}>
-                            ⏹ Stop
+                        <button class="btn-suspend" onclick="suspendNode('${status.nodeId}')" ${!nodeRunning || isSuspended ? 'disabled' : ''}>
+                            ⏸ Suspend
+                        </button>
+                        <button class="btn-resume" onclick="resumeNode('${status.nodeId}')" ${!isSuspended ? 'disabled' : ''}>
+                            ▶ Resume
+                        </button>
+                        <button class="btn-remove" onclick="removeNode('${status.nodeId}')" ${!nodeRunning ? 'disabled' : ''}>
+                            ✖ Remove
                         </button>
                     </div>
                     
@@ -743,12 +1322,19 @@
                     
                     <div class="state-machine">
                         <h3>State Machine (${status.stateMachine.length} Einträge)</h3>
+                        ${status.hasSnapshot 
+                            ? `<div class="snapshot-indicator">📸 Snapshot at index ${status.snapshotBaseIndex}</div>`
+                            : ''
+                        }
                         <div class="state-machine-list">
                             ${status.stateMachine.length === 0 
                                 ? '<div class="state-machine-empty">Keine Commands ausgeführt</div>'
-                                : status.stateMachine.map((cmd, i) => 
-                                    `<div class="state-machine-item">${i + 1}. ${cmd}</div>`
-                                ).join('')
+                                : status.stateMachine.map((cmd, i) => {
+                                    // State machine contains ALL applied entries (including those in snapshot)
+                                    // Display as 1-indexed, offset by snapshotBaseIndex
+                                    const actualIndex = (status.snapshotBaseIndex || 0) + i + 1;
+                                    return `<div class="state-machine-item">${actualIndex}. ${cmd}</div>`;
+                                }).join('')
                             }
                         </div>
                     </div>
@@ -769,6 +1355,169 @@
             statuses.forEach(status => {
                 updateNodeCard(status.nodeId, status);
             });
+            
+            // Update cluster info
+            updateClusterInfo(statuses);
+            
+            // Update monitoring metrics
+            await updateMonitoringMetrics();
+        }
+        
+        async function updateMonitoringMetrics() {
+            // Find a leader or any available node
+            const managerPort = await findAvailableManagerNode();
+            if (!managerPort) {
+                return;
+            }
+            
+            try {
+                // Fetch performance metrics
+                const perfResponse = await fetch(`http://localhost:${managerPort}/api/metrics/performance`);
+                if (perfResponse.ok) {
+                    const perfData = await perfResponse.json();
+                    
+                    document.getElementById('metric-throughput').textContent = 
+                        perfData.throughput ? perfData.throughput.toFixed(2) : '0.00';
+                    document.getElementById('metric-stability').textContent = 
+                        perfData.leaderStability ? perfData.leaderStability.toFixed(1) : '0.0';
+                    document.getElementById('metric-election').textContent = 
+                        perfData.avgElectionTime ? perfData.avgElectionTime.toFixed(1) : '0.0';
+                    document.getElementById('metric-latency').textContent = 
+                        perfData.avgReplicationLatency ? perfData.avgReplicationLatency.toFixed(1) : '0.0';
+                }
+                
+                // Fetch snapshot statistics
+                const snapResponse = await fetch(`http://localhost:${managerPort}/api/metrics/snapshots`);
+                if (snapResponse.ok) {
+                    const snapData = await snapResponse.json();
+                    
+                    document.getElementById('snap-total').textContent = snapData.totalSnapshots || 0;
+                    document.getElementById('snap-compacted').textContent = snapData.compactedEntries || 0;
+                    document.getElementById('snap-logsize').textContent = snapData.currentLogSize || 0;
+                    document.getElementById('snap-ratio').textContent = snapData.compressionRatio || 'N/A';
+                    
+                    if (snapData.lastSnapshot) {
+                        document.getElementById('snap-index').textContent = 
+                            `${snapData.lastSnapshot.lastIncludedIndex} (term ${snapData.lastSnapshot.lastIncludedTerm})`;
+                    } else {
+                        document.getElementById('snap-index').textContent = 'No snapshot';
+                    }
+                }
+                
+                // Fetch replication status
+                const replResponse = await fetch(`http://localhost:${managerPort}/api/metrics/replication`);
+                if (replResponse.ok) {
+                    const replData = await replResponse.json();
+                    updateReplicationStatus(replData);
+                }
+                
+            } catch (error) {
+                console.error('Error fetching monitoring metrics:', error);
+            }
+        }
+        
+        function updateReplicationStatus(data) {
+            const container = document.getElementById('replicationStatus');
+            
+            if (!data.peers || Object.keys(data.peers).length === 0) {
+                container.innerHTML = `
+                    <p style="color: #666; text-align: center; padding: 20px;">
+                        No cluster information available
+                    </p>
+                `;
+                return;
+            }
+            
+            const peers = Object.entries(data.peers);
+            const isLeader = data.role === 'LEADER';
+            
+            // Add header showing current node's perspective
+            let headerHtml = `
+                <div style="background: ${isLeader ? '#e8f5e9' : '#e3f2fd'}; padding: 10px; border-radius: 6px; margin-bottom: 10px; text-align: center;">
+                    <strong>Viewing as: ${data.role}</strong>
+                    ${!isLeader && data.currentLeader ? ` | Current Leader: ${data.currentLeader}` : ''}
+                </div>
+            `;
+            
+            container.innerHTML = headerHtml + peers.map(([peerId, status]) => {
+                if (isLeader) {
+                    // Leader view: show replication details
+                    const upToDate = status.upToDate;
+                    const lag = status.lag || 0;
+                    const lagClass = lag === 0 || lag < 0 ? 'good' : 'warning';
+                    const peerClass = upToDate ? 'up-to-date' : 'lagging';
+                    
+                    return `
+                        <div class="peer-status ${peerClass}">
+                            <div class="peer-name">${peerId}</div>
+                            <div class="peer-info">
+                                <span class="peer-lag">Match: ${status.matchIndex}</span>
+                                <span class="lag-badge ${lagClass}">
+                                    ${lag <= 0 ? 'Up-to-date' : `Lag: ${lag}`}
+                                </span>
+                            </div>
+                        </div>
+                    `;
+                } else {
+                    // Follower view: show cluster members
+                    const peerRole = status.role || 'FOLLOWER';
+                    const roleClass = peerRole === 'LEADER' ? 'up-to-date' : 'lagging';
+                    const roleIcon = peerRole === 'LEADER' ? '👑' : '📡';
+                    
+                    return `
+                        <div class="peer-status ${roleClass}">
+                            <div class="peer-name">${roleIcon} ${peerId}</div>
+                            <div class="peer-info">
+                                <span class="peer-lag">${status.status || peerRole}</span>
+                            </div>
+                        </div>
+                    `;
+                }
+            }).join('');
+        }
+        
+        async function createSnapshot() {
+            // Find the leader node for snapshot creation
+            const leaderPort = await findLeaderNode();
+            if (!leaderPort) {
+                showMessage('✗ No leader available to create snapshot', 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`http://localhost:${leaderPort}/api/snapshot/create`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                if (data.success) {
+                    showMessage('✓ Snapshot created successfully on leader!', 'success');
+                    setTimeout(() => updateMonitoringMetrics(), 500);
+                } else {
+                    showMessage(`✗ ${data.message}`, 'error');
+                }
+            } catch (error) {
+                showMessage(`✗ Error creating snapshot: ${error.message}`, 'error');
+            }
+        }
+        
+        function updateClusterInfo(statuses) {
+            const runningNodes = statuses.filter(s => !s.error && s.state !== 'OFFLINE').length;
+            const suspendedNodes = statuses.filter(s => s.state === 'SUSPENDED' || s.suspended).length;
+            const leaders = statuses.filter(s => s.state === 'LEADER').length;
+            const currentLeader = statuses.find(s => s.state === 'LEADER');
+            
+            const clusterInfo = document.getElementById('clusterInfo');
+            if (clusterInfo) {
+                clusterInfo.innerHTML = `
+                    <div><strong>Total Nodes:</strong> ${nodes.length}</div>
+                    <div><strong>Running:</strong> ${runningNodes}</div>
+                    <div><strong>Suspended:</strong> ${suspendedNodes}</div>
+                    <div><strong>Offline:</strong> ${nodes.length - runningNodes - suspendedNodes}</div>
+                    <div><strong>Current Leader:</strong> ${currentLeader ? currentLeader.nodeId : 'None'}</div>
+                    <div><strong>Leader Count:</strong> ${leaders} ${leaders > 1 ? '⚠️ Split Brain!' : ''}</div>
+                `;
+            }
         }
         
         // Enter-Taste für Command-Submit
@@ -781,8 +1530,14 @@
         // Make functions global
         window.startNode = startNode;
         window.stopNode = stopNode;
+        window.suspendNode = suspendNode;
+        window.resumeNode = resumeNode;
+        window.addNode = addNode;
+        window.removeNode = removeNode;
         window.submitCommand = submitCommand;
+        window.linearizableRead = linearizableRead;
         window.refreshStatus = refreshStatus;
+        window.createSnapshot = createSnapshot;
         
         // Initial load
         refreshStatus();

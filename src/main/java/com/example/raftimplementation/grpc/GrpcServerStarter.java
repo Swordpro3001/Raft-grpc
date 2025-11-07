@@ -5,6 +5,7 @@ import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 import jakarta.annotation.PostConstruct;
@@ -12,6 +13,7 @@ import jakarta.annotation.PreDestroy;
 import java.io.IOException;
 
 @Component
+@ConditionalOnProperty(name = "raft.node.enabled", havingValue = "true", matchIfMissing = true)
 @RequiredArgsConstructor
 @Slf4j
 public class GrpcServerStarter {

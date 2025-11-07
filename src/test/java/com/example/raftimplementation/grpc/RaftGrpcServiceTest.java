@@ -119,7 +119,7 @@ class RaftGrpcServiceTest {
 
     @Test
     void testAppendEntriesWithLogEntry() {
-        LogEntry entry = LogEntry.newBuilder()
+        GrpcLogEntry entry = GrpcLogEntry.newBuilder()
             .setTerm(1)
             .setCommand("SET x=1")
             .build();
@@ -264,9 +264,9 @@ class RaftGrpcServiceTest {
 
     @Test
     void testAppendEntriesWithMultipleEntries() {
-        LogEntry entry1 = LogEntry.newBuilder().setTerm(1).setCommand("CMD1").build();
-        LogEntry entry2 = LogEntry.newBuilder().setTerm(1).setCommand("CMD2").build();
-        LogEntry entry3 = LogEntry.newBuilder().setTerm(1).setCommand("CMD3").build();
+        GrpcLogEntry entry1 = GrpcLogEntry.newBuilder().setTerm(1).setCommand("CMD1").build();
+        GrpcLogEntry entry2 = GrpcLogEntry.newBuilder().setTerm(1).setCommand("CMD2").build();
+        GrpcLogEntry entry3 = GrpcLogEntry.newBuilder().setTerm(1).setCommand("CMD3").build();
 
         AppendEntriesRequest request = AppendEntriesRequest.newBuilder()
             .setTerm(1)

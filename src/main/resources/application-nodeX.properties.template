@@ -1,0 +1,39 @@
+# Node X Configuration Template
+# Copy this file and rename it to: application-nodeX.properties
+# Replace X with your node number (e.g., node6, node7, etc.)
+
+# Node Configuration - CHANGE THESE!
+raft.node-id=nodeX
+raft.grpc-port=5005X  # Must be unique (e.g., 50056, 50057, ...)
+raft.http-port=808X   # Must be unique (e.g., 8086, 8087, ...)
+
+# Server Port - MUST MATCH http-port above!
+server.port=808X
+
+# Peers - Add all OTHER nodes in the cluster here
+# Do NOT include this node itself!
+
+raft.peers[0].node-id=node1
+raft.peers[0].host=localhost
+raft.peers[0].grpc-port=50051
+
+raft.peers[1].node-id=node2
+raft.peers[1].host=localhost
+raft.peers[1].grpc-port=50052
+
+raft.peers[2].node-id=node3
+raft.peers[2].host=localhost
+raft.peers[2].grpc-port=50053
+
+raft.peers[3].node-id=node4
+raft.peers[3].host=localhost
+raft.peers[3].grpc-port=50054
+
+raft.peers[4].node-id=node5
+raft.peers[4].host=localhost
+raft.peers[4].grpc-port=50055
+
+# Add more peers as needed:
+# raft.peers[5].node-id=node6
+# raft.peers[5].host=localhost
+# raft.peers[5].grpc-port=50056

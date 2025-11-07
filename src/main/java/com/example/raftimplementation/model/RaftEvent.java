@@ -27,7 +27,13 @@ public class RaftEvent {
         HEARTBEAT_RECEIVED,
         TERM_INCREASED,
         LOG_REPLICATED,
-        COMMAND_RECEIVED
+        COMMAND_RECEIVED,
+        MEMBERSHIP_CHANGE_START,
+        MEMBERSHIP_CHANGE_COMMITTED,
+        SERVER_ADDED,
+        SERVER_REMOVED,
+        SNAPSHOT_CREATED,
+        SNAPSHOT_INSTALLED
     }
     
     public String getFormattedTimestamp() {

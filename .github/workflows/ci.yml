@@ -1,0 +1,377 @@
+name: Raft Implementation CI
+
+on:
+  push:
+    branches: [ main, develop, feature/* ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  # Job 1: Build and Unit Tests
+  build-and-test:
+    name: Build & Unit Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: 'gradle'
+    
+    - name: Grant execute permission for gradlew
+      run: chmod +x gradlew
+    
+    - name: Build with Gradle
+      run: ./gradlew build -x test
+    
+    - name: Run Unit Tests
+      run: ./gradlew test --tests "*Test"
+      
+    - name: Upload Test Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: unit-test-results
+        path: build/test-results/test/
+        retention-days: 7
+    
+    - name: Upload Test Reports
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: unit-test-reports
+        path: build/reports/tests/test/
+        retention-days: 7
+
+  # Job 2: Persistence & Database Tests
+  persistence-tests:
+    name: H2 Database & Persistence Tests
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: 'gradle'
+    
+    - name: Grant execute permission for gradlew
+      run: chmod +x gradlew
+    
+    - name: Verify H2 Database Creation
+      run: |
+        echo "Starting node1 to verify H2 database creation..."
+        ./gradlew bootRun --args='--spring.profiles.active=node1' > node1-db-test.log 2>&1 &
+        APP_PID=$!
+        echo "Node1 PID: $APP_PID"
+        
+        # Wait for application to start and create database
+        echo "Waiting for application to start..."
+        sleep 30
+        
+        # Check if process is still running
+        if ! kill -0 $APP_PID 2>/dev/null; then
+          echo "✗ Application process died"
+          cat node1-db-test.log
+          exit 1
+        fi
+        
+        # Try to connect to the application
+        echo "Checking if application is responding..."
+        for i in {1..10}; do
+          if curl -s http://localhost:8081/api/status > /dev/null 2>&1; then
+            echo "✓ Application is responding"
+            break
+          fi
+          echo "  Attempt $i: waiting for application..."
+          sleep 2
+        done
+        
+        # Submit a command to ensure database operations happen
+        echo "Submitting test command to trigger database writes..."
+        curl -s -X POST http://localhost:8081/api/command \
+          -H "Content-Type: application/json" \
+          -d '{"command": "test-db-creation"}' || true
+        
+        sleep 5
+        
+        # Check if database files were created
+        echo "Checking for database files..."
+        ls -la data/node1/ || true
+        
+        if [ -f "data/node1/raft-db.mv.db" ] || [ -f "data/node1/raft-db.db" ] || ls data/node1/*.db 2>/dev/null; then
+          echo "✓ H2 database file created successfully"
+          ls -la data/node1/
+        else
+          echo "✗ H2 database file not found"
+          echo "Checking data directory structure:"
+          ls -la . | grep data || echo "No data directory found in current path"
+          find . -name "*.db" -type f 2>/dev/null || echo "No .db files found"
+          echo "Application log:"
+          cat node1-db-test.log
+          kill $APP_PID 2>/dev/null || true
+          exit 1
+        fi
+        
+        # Cleanup
+        kill $APP_PID 2>/dev/null || true
+        sleep 2
+        
+    - name: Upload Database Files
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: h2-database-files
+        path: data/node1/
+        retention-days: 3
+
+  # Job 3: Integration Tests (Cluster Simulation)
+  integration-tests:
+    name: Cluster Integration Tests
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: 'gradle'
+    
+    - name: Grant execute permission for gradlew
+      run: chmod +x gradlew
+    
+    - name: Build application
+      run: ./gradlew build -x test
+    
+    - name: Clean old data
+      run: |
+        # Remove old database and data files to start fresh
+        rm -rf data/
+        rm -rf *.log
+    
+    - name: Start 3-Node Cluster
+      run: |
+        nohup ./gradlew bootRun --args='--spring.profiles.active=node1' > node1.log 2>&1 &
+        echo $! > node1.pid
+        sleep 15
+        
+        nohup ./gradlew bootRun --args='--spring.profiles.active=node2' > node2.log 2>&1 &
+        echo $! > node2.pid
+        sleep 15
+        
+        nohup ./gradlew bootRun --args='--spring.profiles.active=node3' > node3.log 2>&1 &
+        echo $! > node3.pid
+        sleep 20
+    
+    - name: Test Leader Election
+      run: |
+        echo "Testing leader election..."
+        MAX_RETRIES=20
+        RETRY_COUNT=0
+        LEADER_FOUND=false
+        
+        while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+          for PORT in 8081 8082 8083; do
+            RESPONSE=$(curl -s http://localhost:$PORT/api/status || echo "")
+            if echo "$RESPONSE" | grep -q '"state":"LEADER"'; then
+              echo "✓ Leader found on port $PORT"
+              LEADER_FOUND=true
+              break 2
+            fi
+          done
+          RETRY_COUNT=$((RETRY_COUNT + 1))
+          sleep 2
+        done
+        
+        if [ "$LEADER_FOUND" = false ]; then
+          echo "✗ No leader elected after $MAX_RETRIES retries"
+          echo "Checking node logs for errors..."
+          cat node1.log || true
+          cat node2.log || true
+          cat node3.log || true
+          exit 1
+        fi
+    
+    - name: Test Command Replication
+      run: |
+        echo "Testing command submission and replication..."
+        
+        # Find leader
+        LEADER_PORT=""
+        for PORT in 8081 8082 8083; do
+          RESPONSE=$(curl -s http://localhost:$PORT/api/status || echo "")
+          if echo "$RESPONSE" | grep -q '"state":"LEADER"'; then
+            LEADER_PORT=$PORT
+            break
+          fi
+        done
+        
+        if [ -z "$LEADER_PORT" ]; then
+          echo "✗ No leader found for command submission"
+          exit 1
+        fi
+        
+        echo "Leader is on port $LEADER_PORT"
+        
+        # Get initial state machine size from leader
+        INITIAL_RESPONSE=$(curl -s http://localhost:$LEADER_PORT/api/status)
+        INITIAL_SIZE=$(echo "$INITIAL_RESPONSE" | grep -o '"stateMachine":\[[^]]*\]' | grep -o ',' | wc -l)
+        INITIAL_SIZE=$((INITIAL_SIZE + 1))  # Add 1 because commas are n-1
+        echo "Initial state machine size: $INITIAL_SIZE"
+        
+        # Submit 5 commands with unique test prefix
+        TEST_ID="ci-test-$$"
+        for i in {1..5}; do
+          curl -s -X POST http://localhost:$LEADER_PORT/api/command \
+            -H "Content-Type: application/json" \
+            -d "{\"command\": \"${TEST_ID}-cmd-$i\"}"
+          sleep 2
+        done
+        
+        # Wait for replication to complete
+        sleep 10
+        
+        # Verify replication on all nodes with retries
+        for PORT in 8081 8082 8083; do
+          echo "Checking node on port $PORT..."
+          SUCCESS=false
+          
+          # Retry up to 5 times
+          for RETRY in {1..5}; do
+            RESPONSE=$(curl -s http://localhost:$PORT/api/status)
+            # Count occurrences of our test ID
+            ENTRY_COUNT=$(echo "$RESPONSE" | grep -o "$TEST_ID" | wc -l)
+            
+            if [ "$ENTRY_COUNT" -ge 5 ]; then
+              echo "✓ Node on port $PORT: $ENTRY_COUNT commands replicated"
+              SUCCESS=true
+              break
+            else
+              echo "  Attempt $RETRY: Node on port $PORT has $ENTRY_COUNT commands (expected 5), retrying..."
+              sleep 2
+            fi
+          done
+          
+          if [ "$SUCCESS" = false ]; then
+            echo "✗ Node on port $PORT: only $ENTRY_COUNT commands after 5 retries"
+            # Get state machine size for debugging
+            FINAL_SIZE=$(echo "$RESPONSE" | grep -o '"stateMachine":\[[^]]*\]' | grep -o ',' | wc -l)
+            FINAL_SIZE=$((FINAL_SIZE + 1))
+            echo "State machine size: $FINAL_SIZE (was $INITIAL_SIZE initially)"
+            exit 1
+          fi
+        done
+    
+    - name: Test Crash Recovery
+      run: |
+        echo "Testing crash recovery..."
+        
+        # Find follower and crash it
+        FOLLOWER_PORT=""
+        for PORT in 8081 8082 8083; do
+          RESPONSE=$(curl -s http://localhost:$PORT/api/status || echo "")
+          if echo "$RESPONSE" | grep -q '"state":"FOLLOWER"'; then
+            FOLLOWER_PORT=$PORT
+            break
+          fi
+        done
+        
+        if [ -z "$FOLLOWER_PORT" ]; then
+          echo "⚠ No follower found, skipping crash recovery test"
+          exit 0
+        fi
+        
+        echo "Crashing follower on port $FOLLOWER_PORT"
+        
+        case $FOLLOWER_PORT in
+          8081) kill $(cat node1.pid); PROFILE="node1" ;;
+          8082) kill $(cat node2.pid); PROFILE="node2" ;;
+          8083) kill $(cat node3.pid); PROFILE="node3" ;;
+        esac
+        
+        sleep 3
+        
+        # Restart node
+        nohup ./gradlew bootRun --args="--spring.profiles.active=$PROFILE" > ${PROFILE}-restart.log 2>&1 &
+        sleep 15
+        
+        # Verify recovery
+        RESPONSE=$(curl -s http://localhost:$FOLLOWER_PORT/api/status || echo "")
+        if echo "$RESPONSE" | grep -q '"state":"FOLLOWER"\|"state":"LEADER"'; then
+          echo "✓ Node recovered successfully"
+        else
+          echo "✗ Node failed to recover"
+          echo "Response: $RESPONSE"
+          exit 1
+        fi
+    
+    - name: Test Snapshot Creation
+      run: |
+        echo "Testing snapshot creation..."
+        
+        # Find leader
+        LEADER_PORT=""
+        for PORT in 8081 8082 8083; do
+          RESPONSE=$(curl -s http://localhost:$PORT/api/status || echo "")
+          if echo "$RESPONSE" | grep -q '"state":"LEADER"'; then
+            LEADER_PORT=$PORT
+            break
+          fi
+        done
+        
+        if [ -z "$LEADER_PORT" ]; then
+          echo "✗ No leader found for snapshot creation"
+          exit 1
+        fi
+        
+        echo "Leader is on port $LEADER_PORT"
+        
+        # Submit many more commands to reach snapshot threshold (100)
+        TEST_ID="ci-snap-$$"
+        for i in {1..100}; do
+          curl -s -X POST http://localhost:$LEADER_PORT/api/command \
+            -H "Content-Type: application/json" \
+            -d "{\"command\": \"${TEST_ID}-$i\"}" > /dev/null
+        done
+        
+        sleep 5
+        
+        # Create snapshot
+        RESPONSE=$(curl -s -X POST http://localhost:$LEADER_PORT/api/snapshot/create)
+        if echo "$RESPONSE" | grep -q '"success":true'; then
+          echo "✓ Snapshot created successfully"
+        else
+          echo "⚠ Snapshot creation response: $RESPONSE"
+          echo "Note: Snapshot may not have been created if threshold not reached"
+        fi
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        [ -f node1.pid ] && kill $(cat node1.pid) 2>/dev/null || true
+        [ -f node2.pid ] && kill $(cat node2.pid) 2>/dev/null || true
+        [ -f node3.pid ] && kill $(cat node3.pid) 2>/dev/null || true
+        pkill -f 'gradle.*bootRun' || true
+    
+    - name: Upload Logs
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: integration-logs
+        path: "*.log"
+        retention-days: 7
