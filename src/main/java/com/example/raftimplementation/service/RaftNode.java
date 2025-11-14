@@ -582,7 +582,7 @@ public class RaftNode {
         matchIndex.remove(nodeId);
     }
     
-    public VoteResponse handleVoteRequest(VoteRequest request) {
+    public synchronized VoteResponse handleVoteRequest(VoteRequest request) {
         log.info("Received vote request from {} for term {}", request.getCandidateId(), request.getTerm());
         
         // Deny votes when suspended

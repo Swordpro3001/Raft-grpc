@@ -19,6 +19,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -408,5 +409,60 @@ class RaftNodeTest {
         LogEntry storedEntry = raftNode.getRaftLog().get(0);
         assertEquals("TEST_COMMAND", storedEntry.getCommand());
         assertEquals(3, storedEntry.getTerm());
+    }
+
+    @Test
+    void testConcurrentVoteRequests() throws InterruptedException {
+        int threadCount = 20;
+
+        Thread[] threads = new Thread[threadCount];
+        VoteResponse[] responses = new VoteResponse[threadCount];
+
+        // Latch sorgt dafür, dass alle Threads genau gleichzeitig starten
+        CountDownLatch startLatch = new CountDownLatch(1);
+
+        for (int i = 0; i < threadCount; i++) {
+            final int index = i;
+            threads[i] = new Thread(() -> {
+                try {
+                    startLatch.await(); // warten, bis alle Threads bereit sind
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+
+                VoteRequest request = VoteRequest.newBuilder()
+                        .setTerm(5)
+                        .setCandidateId("candidate-" + index)
+                        .setLastLogIndex(-1)
+                        .setLastLogTerm(0)
+                        .build();
+
+                responses[index] = raftNode.handleVoteRequest(request);
+            });
+            threads[i].start();
+        }
+
+        // Jetzt starten wir alle gleichzeitig
+        startLatch.countDown();
+
+        // Warten auf alle Threads
+        for (Thread t : threads) {
+            t.join();
+        }
+
+        // Auswerten
+        int grantedCount = 0;
+        for (VoteResponse r : responses) {
+            if (r != null && r.getVoteGranted()) {
+                grantedCount++;
+            }
+        }
+
+        // Prüfen
+        assertEquals(1, grantedCount,
+                "Es darf nur genau EIN VoteGranted geben. Wenn >1, liegt ein Race Condition vor.");
+
+        assertNotNull(raftNode.getVotedFor(),
+                "Node muss genau einen Kandidaten gewählt haben");
     }
 }
