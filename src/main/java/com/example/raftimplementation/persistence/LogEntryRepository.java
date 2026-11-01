@@ -34,6 +34,15 @@ public interface LogEntryRepository extends JpaRepository<LogEntryEntity, Long> 
     void deleteByNodeIdAndLogIndexLessThanEqual(String nodeId, int logIndex);
     
     /**
+     * Delete all log entries for a node from a specific index onwards.
+     * Used when a conflict with the leader's log is detected.
+     */
+    @Modifying
+    @Transactional
+    @Query("DELETE FROM LogEntryEntity l WHERE l.nodeId = ?1 AND l.logIndex >= ?2")
+    void deleteByNodeIdAndLogIndexGreaterThanEqual(String nodeId, int logIndex);
+
+    /**
      * Delete all log entries for a node.
      */
     @Modifying

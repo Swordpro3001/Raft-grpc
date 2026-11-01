@@ -6,6 +6,7 @@ import com.example.raftimplementation.grpc.AppendEntriesResponse;
 import com.example.raftimplementation.grpc.GrpcLogEntry;
 import com.example.raftimplementation.grpc.VoteRequest;
 import com.example.raftimplementation.grpc.VoteResponse;
+import com.example.raftimplementation.model.CommandResult;
 import com.example.raftimplementation.model.LogEntry;
 import com.example.raftimplementation.model.NodeState;
 import com.example.raftimplementation.model.RaftEvent;
@@ -73,7 +74,7 @@ class RaftNodeTest {
         defaultState.setLastUpdated(System.currentTimeMillis());
         
         when(persistenceService.loadState(anyString())).thenReturn(defaultState);
-        when(persistenceService.loadLog(anyString())).thenReturn(new ArrayList<>());
+        when(persistenceService.loadLog(anyString(), anyInt())).thenReturn(new ArrayList<>());
         when(persistenceService.loadSnapshot(anyString())).thenReturn(Optional.empty());
         
         raftNode = new RaftNode(config, persistenceService);
@@ -92,11 +93,7 @@ class RaftNodeTest {
 
     @Test
     void testSubmitCommand() {
-        // Submit command (will fail unless this node is leader, but adds to log)
-        boolean result = raftNode.submitCommand("SET x=1");
-        
-        // Non-leaders should return false
-        assertFalse(result);
+        assertEquals(CommandResult.NOT_LEADER, raftNode.submitCommand("SET x=1"));
     }
 
     @Test

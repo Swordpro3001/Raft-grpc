@@ -5,8 +5,11 @@ import com.example.raftimplementation.grpc.*;
 import com.example.raftimplementation.model.*;
 import com.example.raftimplementation.persistence.RaftPersistenceService;
 import com.example.raftimplementation.persistence.RaftStateEntity;
+import com.google.protobuf.ByteString;
+import com.google.protobuf.InvalidProtocolBufferException;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.stub.StreamObserver;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -17,186 +20,1239 @@ import jakarta.annotation.PreDestroy;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
+/**
+ * The Raft consensus algorithm (leader election, log replication, membership changes, snapshots).
+ *
+ * Concurrency: all consensus state is guarded by this object's monitor. Timers, RPC handlers and
+ * RPC callbacks each take the monitor, change state, and start any outgoing RPCs asynchronously,
+ * so no thread ever waits for the network while holding it. State is written to the database
+ * while the monitor is held, which guarantees that it is durable before any reply is sent.
+ *
+ * Log indices are logical and start at 0; -1 means "no entry". The in-memory log only holds the
+ * entries after the latest snapshot, see {@link #getLogBaseIndex()}.
+ */
 @Service
 @ConditionalOnProperty(name = "raft.node.enabled", havingValue = "true", matchIfMissing = true)
 @Slf4j
-@Getter
 public class RaftNode {
+    public static final int MAX_GRPC_MESSAGE_BYTES = 64 * 1024 * 1024;
+
+    private static final int MAX_EVENTS = 100;
+    private static final int MAX_ENTRIES_PER_APPEND = 256;
+    private static final long THROUGHPUT_WINDOW_MS = 60_000;
+    private static final double LATENCY_SMOOTHING = 0.2;
+
+    @Getter
     private final RaftConfig config;
     private final RaftPersistenceService persistenceService;
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(3);
-    private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
-    private final Map<String, RaftServiceGrpc.RaftServiceBlockingStub> stubs = new ConcurrentHashMap<>();
-    
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "raft-timer");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private final Map<String, Peer> peers = new ConcurrentHashMap<>();
+    private final Map<String, ServerInfo> knownServers = new ConcurrentHashMap<>();
 
+    @Getter
     private volatile NodeState state = NodeState.FOLLOWER;
+    @Getter
     private final AtomicInteger currentTerm = new AtomicInteger(0);
+    @Getter
     private volatile String votedFor = null;
+    @Getter
     private volatile String currentLeader = null;
-    private final List<LogEntry> raftLog = Collections.synchronizedList(new ArrayList<>());
-    private final AtomicInteger commitIndex = new AtomicInteger(-1);  // Start at -1: no entries committed yet
-    private final AtomicInteger lastApplied = new AtomicInteger(-1);   // Start at -1: no entries applied yet
-    
+    private final List<LogEntry> raftLog = new ArrayList<>();
+    @Getter
+    private final AtomicInteger commitIndex = new AtomicInteger(-1);
+    @Getter
+    private final AtomicInteger lastApplied = new AtomicInteger(-1);
 
     private final Map<String, Integer> nextIndex = new ConcurrentHashMap<>();
     private final Map<String, Integer> matchIndex = new ConcurrentHashMap<>();
-    
 
-    private final List<String> stateMachine = Collections.synchronizedList(new ArrayList<>());
-    
+    private final List<String> stateMachine = new ArrayList<>();
+
+    // Membership: the latest configuration in the log is always the one in effect
+    private ClusterConfiguration bootstrapConfiguration = new ClusterConfiguration();
+    private ClusterConfiguration configuration = bootstrapConfiguration;
+    private int configurationIndex = -1;
+
     // Snapshot state for log compaction
+    @Getter
     private volatile Snapshot lastSnapshot = null;
-    private final AtomicInteger compactedEntries = new AtomicInteger(0);
+    @Getter
     private final AtomicInteger totalSnapshots = new AtomicInteger(0);
-    private static final int SNAPSHOT_THRESHOLD = 100; // Create snapshot after 100 entries
-    
 
-    private final List<RaftEvent> events =
-        Collections.synchronizedList(new LinkedList<>());
-    private static final int MAX_EVENTS = 100; 
-    
+    // Clients waiting for their command or read to be confirmed by a quorum
+    private final SortedMap<Integer, PendingCommand> pendingCommands = new TreeMap<>();
+    private final List<ReadBarrier> readBarriers = new ArrayList<>();
+    private long rpcSequence = 0;
 
-    private volatile long lastHeartbeat = System.currentTimeMillis();
+    private final Deque<RaftEvent> events = new ArrayDeque<>();
+    private final Deque<Long> recentCommits = new ArrayDeque<>();
+    private double averageCommitLatencyMs = 0;
+    private long leaderSinceMillis = 0;
+
+    private volatile long lastLeaderContact = 0;
     private ScheduledFuture<?> electionTask;
     private ScheduledFuture<?> heartbeatTask;
+    private long electionTimerGeneration = 0;
+    // Bumped whenever an election round is over, so that late responses to it are ignored
+    private long electionEpoch = 0;
 
-    /**
-     * -- GETTER --
-     *  Checks if the node is currently suspended.
-     */
     // Suspension state: keeps Spring Boot running but pauses Raft participation
+    @Getter
     private volatile boolean suspended = false;
-    
-    private static final int ELECTION_TIMEOUT_MIN = 3000;
-    private static final int ELECTION_TIMEOUT_MAX = 5000;
-    private static final int HEARTBEAT_INTERVAL = 1000;
-    
+
     public RaftNode(RaftConfig config, RaftPersistenceService persistenceService) {
         this.config = config;
         this.persistenceService = persistenceService;
     }
-    
+
+    // ==================== Lifecycle ====================
+
     @PostConstruct
-    public void init() {
-        log.info("Initializing Raft node: {}", config.getNodeId());
-        
-        // Load persisted state (currentTerm, votedFor)
-        RaftStateEntity persistedState = persistenceService.loadState(config.getNodeId());
+    public synchronized void init() {
+        String self = config.getNodeId();
+        if (self == null || self.isBlank()) {
+            throw new IllegalStateException("raft.node-id is required to run as a Raft node");
+        }
+        log.info("Initializing Raft node: {}", self);
+
+        RaftStateEntity persistedState = persistenceService.loadState(self);
         currentTerm.set(persistedState.getCurrentTerm());
         votedFor = persistedState.getVotedFor();
-        log.info("Loaded persisted state: term={}, votedFor={}", currentTerm.get(), votedFor);
-        
-        // Load persisted log entries
-        List<LogEntry> persistedLog = persistenceService.loadLog(config.getNodeId());
-        synchronized (raftLog) {
-            raftLog.addAll(persistedLog);
-        }
-        log.info("Loaded {} persisted log entries", persistedLog.size());
-        
-        // Load persisted snapshot
-        persistenceService.loadSnapshot(config.getNodeId()).ifPresent(snapshot -> {
+
+        persistenceService.loadSnapshot(self).ifPresent(snapshot -> {
             lastSnapshot = snapshot;
-            synchronized (stateMachine) {
-                stateMachine.clear();
-                stateMachine.addAll(snapshot.getStateMachineState());
-            }
-            commitIndex.set(Math.max(commitIndex.get(), snapshot.getLastIncludedIndex()));
-            lastApplied.set(Math.max(lastApplied.get(), snapshot.getLastIncludedIndex()));
-            log.info("Loaded persisted snapshot: lastIncludedIndex={}, stateMachineSize={}", 
-                    snapshot.getLastIncludedIndex(), stateMachine.size());
+            stateMachine.addAll(snapshot.getStateMachineState());
+            commitIndex.set(snapshot.getLastIncludedIndex());
+            lastApplied.set(snapshot.getLastIncludedIndex());
         });
-        
-        // Connect to peers
-        for (RaftConfig.PeerConfig peer : config.getPeers()) {
-            if (!peer.getNodeId().equals(config.getNodeId())) {
-                ManagedChannel channel = ManagedChannelBuilder
-                    .forAddress(peer.getHost(), peer.getGrpcPort())
-                    .usePlaintext()
-                    .build();
-                channels.put(peer.getNodeId(), channel);
-                stubs.put(peer.getNodeId(), RaftServiceGrpc.newBlockingStub(channel));
-                log.info("Connected to peer: {} at {}:{}", peer.getNodeId(), peer.getHost(), peer.getGrpcPort());
-            }
+        raftLog.addAll(persistenceService.loadLog(self, snapshotIndex()));
+        log.info("Recovered term={}, votedFor={}, log up to index {}", currentTerm.get(), votedFor, lastLogIndex());
+
+        if (!config.isJoin()) {
+            Map<String, ServerInfo> servers = config.initialServers();
+            bootstrapConfiguration = ClusterConfiguration.createNew(servers.keySet(), servers);
         }
-        
-
-        startElectionTimer();
-        
-
-        scheduler.scheduleAtFixedRate(this::applyCommittedEntries, 100, 100, TimeUnit.MILLISECONDS);
+        reloadConfiguration();
+        resetElectionTimer();
     }
-    
+
     @PreDestroy
-    public void shutdown() {
+    public synchronized void shutdown() {
         log.info("Shutting down Raft node: {}", config.getNodeId());
-        if (electionTask != null) {
-            electionTask.cancel(true);
-        }
-        if (heartbeatTask != null) {
-            heartbeatTask.cancel(true);
-        }
-        scheduler.shutdown();
-        channels.values().forEach(ManagedChannel::shutdown);
+        cancelTimers();
+        failPendingRequests();
+        scheduler.shutdownNow();
+        peers.values().forEach(peer -> peer.channel.shutdownNow());
     }
-    
+
     /**
      * Suspends Raft participation while keeping Spring Boot application running.
-     * Stops heartbeats, elections, and command processing but keeps the app alive.
+     * The term and vote stay as they are: forgetting them would allow voting twice in a term.
      */
     public synchronized void suspend() {
         if (suspended) {
             log.warn("Node {} is already suspended", config.getNodeId());
             return;
         }
-        
-        log.info("Suspending Raft node: {}", config.getNodeId());
         suspended = true;
-        
-        // Cancel timers to stop participating in Raft protocol
-        if (electionTask != null) {
-            electionTask.cancel(true);
-            electionTask = null;
-        }
-        if (heartbeatTask != null) {
-            heartbeatTask.cancel(true);
-            heartbeatTask = null;
-        }
-        
-        // Become follower and clear leadership
+        cancelTimers();
         if (state == NodeState.LEADER) {
-            state = NodeState.FOLLOWER;
+            failPendingRequests();
         }
+        state = NodeState.FOLLOWER;
         currentLeader = null;
-        votedFor = null;
-        
-        logEvent(RaftEvent.EventType.STATE_CHANGE,
-            "Node SUSPENDED - Spring Boot running, Raft paused");
-        
-        log.info("Node {} suspended successfully. Spring Boot is still running.", config.getNodeId());
+        logEvent(RaftEvent.EventType.STATE_CHANGE, "Node suspended, Raft paused");
     }
-    
+
     /**
      * Resumes Raft participation after suspension.
-     * Restarts election timer and rejoins the cluster.
      */
     public synchronized void resume() {
         if (!suspended) {
             log.warn("Node {} is not suspended", config.getNodeId());
             return;
         }
-        
-        log.info("Resuming Raft node: {}", config.getNodeId());
         suspended = false;
-        
-        // Restart election timer to rejoin cluster
+        resetElectionTimer();
+        logEvent(RaftEvent.EventType.STATE_CHANGE, "Node resumed, rejoining cluster as FOLLOWER");
+    }
+
+    // ==================== Leader Election ====================
+
+    private void resetElectionTimer() {
+        if (suspended || scheduler.isShutdown()) {
+            return;
+        }
+        if (electionTask != null) {
+            electionTask.cancel(false);
+        }
+        long generation = ++electionTimerGeneration;
+        int timeout = ThreadLocalRandom.current().nextInt(config.getElectionTimeoutMinMs(), config.getElectionTimeoutMaxMs() + 1);
+        electionTask = scheduler.schedule(() -> onElectionTimeout(generation), timeout, TimeUnit.MILLISECONDS);
+    }
+
+    private synchronized void onElectionTimeout(long generation) {
+        // The timer may have fired just while another thread was resetting it
+        if (generation != electionTimerGeneration || suspended || state == NodeState.LEADER) {
+            return;
+        }
+        try {
+            if (state == NodeState.CANDIDATE) {
+                logEvent(RaftEvent.EventType.ELECTION_LOST, "No majority for term " + currentTerm.get());
+            }
+            // Servers that are not part of the configuration must not disturb the cluster
+            if (configuration.contains(config.getNodeId())) {
+                startPreVote();
+            }
+        } catch (RuntimeException e) {
+            log.error("Election attempt failed", e);
+        } finally {
+            if (state != NodeState.LEADER) {
+                resetElectionTimer();
+            }
+        }
+    }
+
+    /**
+     * Pre-vote (Raft thesis, section 9.6): find out whether an election could succeed before
+     * increasing the term, so a server that was partitioned away cannot depose a healthy leader.
+     */
+    private void startPreVote() {
+        long epoch = ++electionEpoch;
+        currentLeader = null;
+
+        Set<String> granted = new HashSet<>(Set.of(config.getNodeId()));
+        if (configuration.hasQuorum(granted)) {
+            startElection();
+            return;
+        }
+
+        VoteRequest request = buildVoteRequest(currentTerm.get() + 1);
+        for (Peer peer : votingPeers()) {
+            peer.stub(config.getRpcTimeoutMs()).preVote(request, responseHandler(
+                response -> onPreVoteResponse(epoch, peer, granted, response),
+                error -> onRpcFailure(peer, "PreVote", error)));
+        }
+    }
+
+    private synchronized void onPreVoteResponse(long epoch, Peer peer, Set<String> granted, VoteResponse response) {
+        if (response.getTerm() > currentTerm.get()) {
+            stepDown(response.getTerm());
+            return;
+        }
+        if (epoch != electionEpoch || state == NodeState.LEADER || suspended || !response.getVoteGranted()) {
+            return;
+        }
+        granted.add(peer.id);
+        if (configuration.hasQuorum(granted)) {
+            startElection();
+        }
+    }
+
+    private void startElection() {
+        int newTerm = currentTerm.get() + 1;
+        String self = config.getNodeId();
+        // Must be durable before the first RequestVote leaves this node
+        persistenceService.saveState(self, newTerm, self);
+
+        long epoch = ++electionEpoch;
+        if (state != NodeState.CANDIDATE) {
+            logEvent(RaftEvent.EventType.STATE_CHANGE, state + " -> CANDIDATE");
+        }
+        state = NodeState.CANDIDATE;
+        currentTerm.set(newTerm);
+        votedFor = self;
+        currentLeader = null;
+        logEvent(RaftEvent.EventType.TERM_INCREASED, "Term increased to " + newTerm);
+        logEvent(RaftEvent.EventType.ELECTION_START, "Starting election with " + configuration);
+        resetElectionTimer();
+
+        Set<String> granted = new HashSet<>(Set.of(self));
+        if (configuration.hasQuorum(granted)) {
+            becomeLeader();
+            return;
+        }
+
+        VoteRequest request = buildVoteRequest(newTerm);
+        for (Peer peer : votingPeers()) {
+            peer.stub(config.getRpcTimeoutMs()).requestVote(request, responseHandler(
+                response -> onVoteResponse(epoch, peer, granted, response),
+                error -> onRpcFailure(peer, "RequestVote", error)));
+        }
+    }
+
+    private synchronized void onVoteResponse(long epoch, Peer peer, Set<String> granted, VoteResponse response) {
+        if (response.getTerm() > currentTerm.get()) {
+            stepDown(response.getTerm());
+            return;
+        }
+        if (epoch != electionEpoch || state != NodeState.CANDIDATE) {
+            return;
+        }
+        if (!response.getVoteGranted()) {
+            logEvent(RaftEvent.EventType.VOTE_DENIED, "Vote denied by " + peer.id);
+            return;
+        }
+        granted.add(peer.id);
+        logEvent(RaftEvent.EventType.VOTE_GRANTED, "Vote granted by " + peer.id);
+        if (configuration.hasQuorum(granted)) {
+            becomeLeader();
+        }
+    }
+
+    private void becomeLeader() {
+        logEvent(RaftEvent.EventType.ELECTION_WON, "Won election for term " + currentTerm.get());
+        logEvent(RaftEvent.EventType.STATE_CHANGE, "CANDIDATE -> LEADER");
+        electionEpoch++;
+        state = NodeState.LEADER;
+        currentLeader = config.getNodeId();
+        leaderSinceMillis = System.currentTimeMillis();
+        if (electionTask != null) {
+            electionTask.cancel(false);
+        }
+
+        int next = lastLogIndex() + 1;
+        matchIndex.clear();
+        nextIndex.clear();
+        for (String peerId : peers.keySet()) {
+            nextIndex.put(peerId, next);
+            matchIndex.put(peerId, -1);
+        }
+
+        // Entries of earlier terms can only commit together with one of the current term (section 5.4.2),
+        // and reads must not be served before that (section 8), so commit a no-op right away
+        appendToOwnLog(new LogEntry(currentTerm.get(), null));
+        advanceCommitIndex();
+
+        heartbeatTask = scheduler.scheduleWithFixedDelay(this::onHeartbeatTick,
+            0, config.getHeartbeatIntervalMs(), TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Becomes a follower of the given term. Only a higher term clears the vote:
+     * a server gets a single vote per term, even if it stepped down within that term.
+     */
+    private void stepDown(int term) {
+        if (term > currentTerm.get()) {
+            persistenceService.saveState(config.getNodeId(), term, null);
+            currentTerm.set(term);
+            votedFor = null;
+            currentLeader = null;
+            logEvent(RaftEvent.EventType.TERM_INCREASED, "Term increased to " + term);
+        }
+        if (state != NodeState.FOLLOWER) {
+            logEvent(RaftEvent.EventType.STATE_CHANGE, state + " -> FOLLOWER");
+        }
+        if (state == NodeState.LEADER) {
+            if (heartbeatTask != null) {
+                heartbeatTask.cancel(false);
+                heartbeatTask = null;
+            }
+            currentLeader = null;
+            failPendingRequests();
+        }
         state = NodeState.FOLLOWER;
-        startElectionTimer();
+        electionEpoch++;
+        resetElectionTimer();
+    }
+
+    public synchronized VoteResponse handleVoteRequest(VoteRequest request) {
+        log.debug("Received vote request from {} for term {}", request.getCandidateId(), request.getTerm());
+
+        if (request.getTerm() > currentTerm.get()) {
+            stepDown(request.getTerm());
+        }
+
+        boolean voteGranted = false;
+        String candidate = request.getCandidateId();
+
+        if (request.getTerm() < currentTerm.get()) {
+            logEvent(RaftEvent.EventType.VOTE_DENIED,
+                "Denied vote to " + candidate + " (stale term " + request.getTerm() + ")");
+        } else if (votedFor != null && !votedFor.equals(candidate)) {
+            logEvent(RaftEvent.EventType.VOTE_DENIED,
+                "Denied vote to " + candidate + " (already voted for " + votedFor + ")");
+        } else if (!isLogUpToDate(request.getLastLogIndex(), request.getLastLogTerm())) {
+            logEvent(RaftEvent.EventType.VOTE_DENIED, "Denied vote to " + candidate + " (log not up-to-date)");
+        } else {
+            // Must be durable before the candidate learns about the vote
+            persistenceService.saveState(config.getNodeId(), currentTerm.get(), candidate);
+            votedFor = candidate;
+            voteGranted = true;
+            resetElectionTimer();
+            logEvent(RaftEvent.EventType.VOTE_GRANTED,
+                "Granted vote to " + candidate + " for term " + request.getTerm());
+        }
+
+        return VoteResponse.newBuilder()
+            .setTerm(currentTerm.get())
+            .setVoteGranted(voteGranted)
+            .build();
+    }
+
+    /**
+     * Grants a pre-vote without changing any state, if the candidate could win a real election
+     * and this server has not heard from a leader within the minimum election timeout.
+     */
+    public synchronized VoteResponse handlePreVote(VoteRequest request) {
+        boolean leaderAlive = state == NodeState.LEADER
+            || System.currentTimeMillis() - lastLeaderContact < config.getElectionTimeoutMinMs();
+        boolean granted = request.getTerm() > currentTerm.get()
+            && !leaderAlive
+            && isLogUpToDate(request.getLastLogIndex(), request.getLastLogTerm());
+
+        log.debug("PreVote for {}: leaderAlive={}, granted={}", request.getCandidateId(), leaderAlive, granted);
+
+        return VoteResponse.newBuilder()
+            .setTerm(currentTerm.get())
+            .setVoteGranted(granted)
+            .build();
+    }
+
+    private VoteRequest buildVoteRequest(int term) {
+        int lastIndex = lastLogIndex();
+        return VoteRequest.newBuilder()
+            .setTerm(term)
+            .setCandidateId(config.getNodeId())
+            .setLastLogIndex(lastIndex)
+            .setLastLogTerm(termAt(lastIndex))
+            .build();
+    }
+
+    private boolean isLogUpToDate(int otherLastIndex, int otherLastTerm) {
+        int lastIndex = lastLogIndex();
+        int lastTerm = termAt(lastIndex);
+        return otherLastTerm > lastTerm || (otherLastTerm == lastTerm && otherLastIndex >= lastIndex);
+    }
+
+    private List<Peer> votingPeers() {
+        return peers.values().stream().filter(peer -> configuration.contains(peer.id)).toList();
+    }
+
+    // ==================== Log Replication: Leader ====================
+
+    private synchronized void onHeartbeatTick() {
+        try {
+            broadcast();
+        } catch (RuntimeException e) {
+            log.error("Heartbeat round failed", e);
+        }
+    }
+
+    private void broadcast() {
+        peers.values().forEach(this::replicate);
+    }
+
+    /**
+     * Sends the next batch of entries to a peer, or an empty heartbeat if it is up to date.
+     * Each peer has at most one RPC in flight. Anything that arrives in the meantime
+     * goes out with the next one, which batches entries automatically under load.
+     */
+    private void replicate(Peer peer) {
+        if (state != NodeState.LEADER) {
+            return;
+        }
+        if (peer.inFlight) {
+            peer.resend = true;
+            return;
+        }
+
+        int next = nextIndex.computeIfAbsent(peer.id, id -> lastLogIndex() + 1);
+        if (next <= snapshotIndex()) {
+            sendSnapshot(peer);
+            return;
+        }
+
+        int prevIndex = next - 1;
+        int from = logicalToPhysical(next);
+        int to = Math.min(raftLog.size(), from + MAX_ENTRIES_PER_APPEND);
+
+        AppendEntriesRequest.Builder request = AppendEntriesRequest.newBuilder()
+            .setTerm(currentTerm.get())
+            .setLeaderId(config.getNodeId())
+            .setPrevLogIndex(prevIndex)
+            .setPrevLogTerm(termAt(prevIndex))
+            .setLeaderCommit(commitIndex.get());
+        for (LogEntry entry : raftLog.subList(from, to)) {
+            request.addEntries(RaftCodec.toGrpc(entry));
+        }
+
+        int sentTerm = currentTerm.get();
+        int sentEntries = to - from;
+        long sequence = rpcSequence;
+        peer.inFlight = true;
+        peer.resend = false;
+        peer.stub(config.getRpcTimeoutMs()).appendEntries(request.build(), responseHandler(
+            response -> onAppendEntriesResponse(peer, sentTerm, prevIndex, sentEntries, sequence, response),
+            error -> onReplicationFailure(peer, "AppendEntries", error)));
+    }
+
+    private synchronized void onAppendEntriesResponse(Peer peer, int sentTerm, int prevIndex, int sentEntries,
+                                                      long sequence, AppendEntriesResponse response) {
+        peer.inFlight = false;
+        if (response.getTerm() > currentTerm.get()) {
+            stepDown(response.getTerm());
+            return;
+        }
+        if (state != NodeState.LEADER || currentTerm.get() != sentTerm || peers.get(peer.id) != peer) {
+            return;
+        }
+
+        acknowledgeReads(peer.id, sequence);
+
+        if (response.getSuccess()) {
+            int match = Math.max(matchIndex.getOrDefault(peer.id, -1), prevIndex + sentEntries);
+            matchIndex.put(peer.id, match);
+            nextIndex.put(peer.id, Math.max(nextIndex.getOrDefault(peer.id, 0), match + 1));
+            advanceCommitIndex();
+        } else {
+            nextIndex.put(peer.id, nextIndexAfterConflict(peer, response));
+        }
+
+        if (peer.resend || nextIndex.get(peer.id) <= lastLogIndex()) {
+            replicate(peer);
+        }
+    }
+
+    private int nextIndexAfterConflict(Peer peer, AppendEntriesResponse response) {
+        int next = response.getConflictIndex();
+        if (response.getConflictTerm() > 0) {
+            // If we also have entries of that term, everything up to our last one of them can match
+            for (int index = lastLogIndex(); index > snapshotIndex(); index--) {
+                int term = termAt(index);
+                if (term == response.getConflictTerm()) {
+                    next = index + 1;
+                    break;
+                }
+                if (term < response.getConflictTerm()) {
+                    break;
+                }
+            }
+        }
+        // Always make progress, and never go back past what the peer has confirmed
+        int current = nextIndex.getOrDefault(peer.id, next);
+        return Math.max(matchIndex.getOrDefault(peer.id, -1) + 1, Math.min(next, current - 1));
+    }
+
+    private synchronized void onReplicationFailure(Peer peer, String rpc, Throwable error) {
+        peer.inFlight = false;
+        onRpcFailure(peer, rpc, error);
+    }
+
+    private void onRpcFailure(Peer peer, String rpc, Throwable error) {
+        log.debug("{} to {} failed: {}", rpc, peer.id, error.getMessage());
+        // gRPC backs off for up to two minutes; a restarted peer should be found on the next tick
+        peer.channel.resetConnectBackoff();
+    }
+
+    /**
+     * Commits the highest index stored on a quorum. Only entries of the current term
+     * are committed by counting replicas (section 5.4.2); earlier ones follow indirectly.
+     */
+    private void advanceCommitIndex() {
+        if (state != NodeState.LEADER) {
+            return;
+        }
+        int candidate = configuration.quorumIndex(matchIndex);
+        if (candidate > commitIndex.get() && termAt(candidate) == currentTerm.get()) {
+            commitIndex.set(candidate);
+            onCommitAdvanced();
+            completeReadBarriers();
+            broadcast();
+        }
+    }
+
+    private void onCommitAdvanced() {
+        applyCommittedEntries();
+
+        if (state == NodeState.LEADER && configurationIndex <= commitIndex.get()) {
+            if (configuration.isJoint()) {
+                // C_old,new is committed, so the leader can move on to C_new
+                appendToOwnLog(new LogEntry(currentTerm.get(), null,
+                    ClusterConfiguration.createNew(configuration.getNewServers(), configuration.getAddresses())));
+                logEvent(RaftEvent.EventType.MEMBERSHIP_CHANGE_COMMITTED,
+                    "C_old,new committed, appended " + configuration);
+                advanceCommitIndex();
+            } else if (!configuration.contains(config.getNodeId())) {
+                logEvent(RaftEvent.EventType.SERVER_REMOVED, "This node left the cluster, stepping down");
+                stepDown(currentTerm.get());
+            }
+        }
+
+        syncPeers();
+
+        if (raftLog.size() >= config.getSnapshotThreshold()
+                && lastApplied.get() - snapshotIndex() >= config.getSnapshotThreshold() / 2) {
+            createSnapshot();
+        }
+    }
+
+    private void applyCommittedEntries() {
+        while (lastApplied.get() < commitIndex.get()) {
+            int index = lastApplied.get() + 1;
+            LogEntry entry = raftLog.get(logicalToPhysical(index));
+
+            if (entry.getCommand() != null) {
+                stateMachine.add(entry.getCommand());
+            }
+            if (entry.isConfigurationEntry()) {
+                logEvent(RaftEvent.EventType.MEMBERSHIP_CHANGE_COMMITTED,
+                    "Configuration committed: " + entry.getConfiguration());
+            }
+            lastApplied.set(index);
+
+            PendingCommand pending = pendingCommands.remove(index);
+            if (pending != null) {
+                recordCommit(pending);
+                pending.result.complete(CommandResult.COMMITTED);
+            }
+        }
+    }
+
+    private void recordCommit(PendingCommand pending) {
+        long now = System.currentTimeMillis();
+        double latency = now - pending.startMillis;
+        averageCommitLatencyMs = averageCommitLatencyMs == 0
+            ? latency
+            : LATENCY_SMOOTHING * latency + (1 - LATENCY_SMOOTHING) * averageCommitLatencyMs;
+        recentCommits.addLast(now);
+        pruneRecentCommits(now);
+    }
+
+    private void pruneRecentCommits(long now) {
+        while (!recentCommits.isEmpty() && now - recentCommits.peekFirst() > THROUGHPUT_WINDOW_MS) {
+            recentCommits.removeFirst();
+        }
+    }
+
+    private void failPendingRequests() {
+        pendingCommands.values().forEach(pending -> pending.result.complete(CommandResult.LEADERSHIP_LOST));
+        pendingCommands.clear();
+        readBarriers.forEach(barrier -> barrier.confirmed.complete(false));
+        readBarriers.clear();
+    }
+
+    // ==================== Log Replication: Follower ====================
+
+    public synchronized AppendEntriesResponse handleAppendEntries(AppendEntriesRequest request) {
+        if (request.getTerm() < currentTerm.get()) {
+            return rejectAppend(-1, 0);
+        }
+        if (state == NodeState.LEADER && request.getTerm() == currentTerm.get()) {
+            log.error("Two leaders in term {}: {} and this node", request.getTerm(), request.getLeaderId());
+            return rejectAppend(-1, 0);
+        }
+
+        observeLeader(request.getTerm(), request.getLeaderId());
+
+        // Consistency check. Anything up to the snapshot is committed and therefore matches.
+        int prevIndex = request.getPrevLogIndex();
+        if (prevIndex > lastLogIndex()) {
+            return rejectAppend(lastLogIndex() + 1, 0);
+        }
+        if (prevIndex > snapshotIndex() && termAt(prevIndex) != request.getPrevLogTerm()) {
+            int conflictTerm = termAt(prevIndex);
+            int firstOfTerm = prevIndex;
+            while (firstOfTerm - 1 > snapshotIndex() && termAt(firstOfTerm - 1) == conflictTerm) {
+                firstOfTerm--;
+            }
+            log.debug("Log mismatch at {}: local term {}, leader has {}", prevIndex, conflictTerm, request.getPrevLogTerm());
+            return rejectAppend(firstOfTerm, conflictTerm);
+        }
+
+        // Skip what we already have, drop what conflicts, append the rest
+        int index = prevIndex;
+        List<LogEntry> newEntries = new ArrayList<>();
+        for (GrpcLogEntry entry : request.getEntriesList()) {
+            index++;
+            if (index <= snapshotIndex()) {
+                continue;
+            }
+            if (index <= lastLogIndex()) {
+                if (termAt(index) == entry.getTerm()) {
+                    continue;
+                }
+                truncateLogFrom(index);
+            }
+            newEntries.add(RaftCodec.fromGrpc(entry));
+        }
+        int lastVerifiedIndex = index;
+
+        if (!newEntries.isEmpty()) {
+            int startIndex = lastLogIndex() + 1;
+            persistenceService.appendLogEntries(config.getNodeId(), startIndex, newEntries);
+            raftLog.addAll(newEntries);
+            for (int i = 0; i < newEntries.size(); i++) {
+                if (newEntries.get(i).isConfigurationEntry()) {
+                    adoptConfiguration(newEntries.get(i).getConfiguration(), startIndex + i);
+                }
+            }
+            logEvent(RaftEvent.EventType.LOG_REPLICATED,
+                "Replicated " + newEntries.size() + " entries from leader " + request.getLeaderId());
+        }
+
+        // Entries beyond the last verified one may be left over from an old leader
+        int newCommit = Math.min(request.getLeaderCommit(), lastVerifiedIndex);
+        if (newCommit > commitIndex.get()) {
+            commitIndex.set(newCommit);
+            onCommitAdvanced();
+        }
+
+        return AppendEntriesResponse.newBuilder()
+            .setTerm(currentTerm.get())
+            .setSuccess(true)
+            .setMatchIndex(lastVerifiedIndex)
+            .build();
+    }
+
+    private AppendEntriesResponse rejectAppend(int conflictIndex, int conflictTerm) {
+        return AppendEntriesResponse.newBuilder()
+            .setTerm(currentTerm.get())
+            .setSuccess(false)
+            .setConflictIndex(conflictIndex)
+            .setConflictTerm(conflictTerm)
+            .build();
+    }
+
+    private void observeLeader(int term, String leaderId) {
+        if (term > currentTerm.get() || state != NodeState.FOLLOWER) {
+            stepDown(term);
+        }
+        if (!leaderId.equals(currentLeader)) {
+            currentLeader = leaderId;
+            logEvent(RaftEvent.EventType.HEARTBEAT_RECEIVED, "Following leader " + leaderId);
+        }
+        lastLeaderContact = System.currentTimeMillis();
+        electionEpoch++;
+        resetElectionTimer();
+    }
+
+    private void truncateLogFrom(int index) {
+        if (index <= commitIndex.get()) {
+            throw new IllegalStateException("Refusing to truncate committed entry " + index
+                + " (commitIndex " + commitIndex.get() + ")");
+        }
+        persistenceService.deleteLogEntriesFrom(config.getNodeId(), index);
+        raftLog.subList(logicalToPhysical(index), raftLog.size()).clear();
+        if (configurationIndex >= index) {
+            reloadConfiguration();
+        }
+    }
+
+    // ==================== Client Requests ====================
+
+    /**
+     * Appends a command to the log and waits until it is committed and applied.
+     * This is the point where Raft can promise the client that the command will survive.
+     */
+    public CommandResult submitCommand(String command) {
+        CompletableFuture<CommandResult> result = new CompletableFuture<>();
+        synchronized (this) {
+            if (suspended) {
+                return CommandResult.SUSPENDED;
+            }
+            if (state != NodeState.LEADER) {
+                return CommandResult.NOT_LEADER;
+            }
+            logEvent(RaftEvent.EventType.COMMAND_RECEIVED, "Received command from client: " + command);
+            int index = appendToOwnLog(new LogEntry(currentTerm.get(), command));
+            pendingCommands.put(index, new PendingCommand(result, System.currentTimeMillis()));
+            advanceCommitIndex();
+            broadcast();
+        }
+        try {
+            return result.get(config.getCommandTimeoutMs(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            synchronized (this) {
+                pendingCommands.values().removeIf(pending -> pending.result == result);
+            }
+            return CommandResult.TIMEOUT;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return CommandResult.TIMEOUT;
+        } catch (ExecutionException e) {
+            throw new IllegalStateException(e.getCause());
+        }
+    }
+
+    /**
+     * Linearizable read barrier (ReadIndex, section 8): true means this node was still the
+     * leader after the call started, so reading its state machine now returns the latest state.
+     * It first needs an entry committed in its own term to know what the latest state is.
+     */
+    public boolean confirmLeadership() {
+        CompletableFuture<Boolean> confirmed = new CompletableFuture<>();
+        synchronized (this) {
+            if (state != NodeState.LEADER || termAt(commitIndex.get()) != currentTerm.get()) {
+                return false;
+            }
+            ReadBarrier barrier = new ReadBarrier(++rpcSequence, new HashSet<>(Set.of(config.getNodeId())), confirmed);
+            readBarriers.add(barrier);
+            completeReadBarriers();
+            broadcast();
+        }
+        try {
+            return confirmed.get(config.getCommandTimeoutMs(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            synchronized (this) {
+                readBarriers.removeIf(barrier -> barrier.confirmed == confirmed);
+            }
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (ExecutionException e) {
+            throw new IllegalStateException(e.getCause());
+        }
+    }
+
+    /**
+     * Only an RPC sent after a barrier was created proves leadership for it. A follower in the
+     * same term acknowledges this node as leader even if its log did not match yet.
+     */
+    private void acknowledgeReads(String peerId, long sequence) {
+        for (ReadBarrier barrier : readBarriers) {
+            if (sequence >= barrier.sequence) {
+                barrier.acks.add(peerId);
+            }
+        }
+        completeReadBarriers();
+    }
+
+    private void completeReadBarriers() {
+        readBarriers.removeIf(barrier -> {
+            boolean done = configuration.hasQuorum(barrier.acks) && lastApplied.get() >= commitIndex.get();
+            if (done) {
+                barrier.confirmed.complete(true);
+            }
+            return done;
+        });
+    }
+
+    public List<String> getStateMachine() {
+        synchronized (this) {
+            return new ArrayList<>(stateMachine);
+        }
+    }
+
+    // ==================== Membership Changes ====================
+
+    /**
+     * Adds a server with joint consensus (section 6): C_old,new is appended here, and
+     * onCommitAdvanced follows up with C_new. Returns false if this node cannot do it now.
+     */
+    public synchronized boolean addServer(ServerInfo serverInfo) {
+        if (!canChangeMembership() || configuration.contains(serverInfo.getNodeId())) {
+            log.warn("Cannot add server {}: not leader, already a member, or a change is in progress", serverInfo);
+            return false;
+        }
+        Set<String> newServers = new HashSet<>(configuration.getNewServers());
+        newServers.add(serverInfo.getNodeId());
+        Map<String, ServerInfo> addresses = new HashMap<>(configuration.getAddresses());
+        addresses.put(serverInfo.getNodeId(), serverInfo);
+
+        logEvent(RaftEvent.EventType.SERVER_ADDED, "Adding server " + serverInfo);
+        startMembershipChange(newServers, addresses);
+        return true;
+    }
+
+    /**
+     * Removes a server with joint consensus. The leader may remove
+     * itself: it steps down as soon as C_new is committed.
+     */
+    public synchronized boolean removeServer(String nodeId) {
+        Set<String> newServers = new HashSet<>(configuration.getNewServers());
+        if (!canChangeMembership() || !newServers.remove(nodeId) || newServers.isEmpty()) {
+            log.warn("Cannot remove server {}: not leader, not a member, last member, or a change is in progress", nodeId);
+            return false;
+        }
+        logEvent(RaftEvent.EventType.SERVER_REMOVED, "Removing server " + nodeId);
+        startMembershipChange(newServers, configuration.getAddresses());
+        return true;
+    }
+
+    /**
+     * One change at a time, and only once the leader has committed an entry in its own term:
+     * otherwise a configuration it does not know of yet could overlap with this one.
+     */
+    private boolean canChangeMembership() {
+        return state == NodeState.LEADER
+            && !configuration.isJoint()
+            && configurationIndex <= commitIndex.get()
+            && termAt(commitIndex.get()) == currentTerm.get();
+    }
+
+    private void startMembershipChange(Set<String> newServers, Map<String, ServerInfo> addresses) {
+        ClusterConfiguration joint = ClusterConfiguration.createJoint(configuration.getNewServers(), newServers, addresses);
+        appendToOwnLog(new LogEntry(currentTerm.get(), null, joint));
+        logEvent(RaftEvent.EventType.MEMBERSHIP_CHANGE_START, "Appended " + joint);
+        advanceCommitIndex();
+    }
+
+    /**
+     * A server uses the latest configuration in its log as soon as it appears there, committed or not.
+     */
+    private void adoptConfiguration(ClusterConfiguration newConfiguration, int index) {
+        configuration = newConfiguration;
+        configurationIndex = index;
+        syncPeers();
+    }
+
+    /**
+     * Finds the latest configuration, after the log changed in a way that may have removed it.
+     */
+    private void reloadConfiguration() {
+        for (int index = lastLogIndex(); index > snapshotIndex(); index--) {
+            LogEntry entry = raftLog.get(logicalToPhysical(index));
+            if (entry.isConfigurationEntry()) {
+                adoptConfiguration(entry.getConfiguration(), index);
+                return;
+            }
+        }
+        boolean fromSnapshot = lastSnapshot != null && lastSnapshot.getConfiguration() != null;
+        adoptConfiguration(fromSnapshot ? lastSnapshot.getConfiguration() : bootstrapConfiguration, snapshotIndex());
+    }
+
+    /**
+     * Connects to every server in the configuration. Departing servers stay connected until
+     * the change is committed, which gives them the chance to learn about their removal.
+     */
+    private void syncPeers() {
+        String self = config.getNodeId();
+        knownServers.putAll(configuration.getAddresses());
+
+        for (String nodeId : configuration.getAllServers()) {
+            ServerInfo address = knownServers.get(nodeId);
+            if (nodeId.equals(self) || peers.containsKey(nodeId)) {
+                continue;
+            }
+            if (address == null) {
+                log.warn("No address known for server {}", nodeId);
+                continue;
+            }
+            ManagedChannel channel = ManagedChannelBuilder
+                .forAddress(address.getHost(), address.getGrpcPort())
+                .usePlaintext()
+                .maxInboundMessageSize(MAX_GRPC_MESSAGE_BYTES)
+                .build();
+            peers.put(nodeId, new Peer(nodeId, channel));
+            nextIndex.put(nodeId, lastLogIndex() + 1);
+            matchIndex.put(nodeId, -1);
+            log.info("Connected to peer {}", address);
+        }
+
+        if (configurationIndex <= commitIndex.get()) {
+            for (String nodeId : new ArrayList<>(peers.keySet())) {
+                if (!configuration.contains(nodeId)) {
+                    peers.remove(nodeId).channel.shutdown();
+                    nextIndex.remove(nodeId);
+                    matchIndex.remove(nodeId);
+                    log.info("Disconnected from removed server {}", nodeId);
+                }
+            }
+        }
+    }
+
+    public synchronized Set<String> getClusterMembers() {
+        return new TreeSet<>(configuration.getAllServers());
+    }
+
+    public ServerInfo getServerInfo(String nodeId) {
+        return knownServers.get(nodeId);
+    }
+
+    // ==================== Snapshots ====================
+
+    /**
+     * Writes the applied state to a snapshot and drops the log entries it covers.
+     */
+    public synchronized void createSnapshot() {
+        int lastIndex = lastApplied.get();
+        if (lastIndex < 0 || lastIndex <= snapshotIndex()) {
+            log.debug("Nothing to snapshot: lastApplied={}, snapshotIndex={}", lastIndex, snapshotIndex());
+            return;
+        }
+        try {
+            List<String> stateCopy = new ArrayList<>(stateMachine);
+            ClusterConfiguration snapshotConfiguration = configurationAt(lastIndex);
+            long sizeBytes = RaftCodec.encodeSnapshot(stateCopy, snapshotConfiguration).length;
+            Snapshot snapshot = new Snapshot(lastIndex, termAt(lastIndex), stateCopy, snapshotConfiguration,
+                System.currentTimeMillis(), sizeBytes);
+
+            // In this order, a crash at any point leaves a state that init() can recover from
+            persistenceService.saveSnapshot(config.getNodeId(), snapshot);
+            persistenceService.compactLog(config.getNodeId(), lastIndex);
+
+            int entriesRemoved = logicalToPhysical(lastIndex) + 1;
+            raftLog.subList(0, entriesRemoved).clear();
+            lastSnapshot = snapshot;
+            totalSnapshots.incrementAndGet();
+
+            logEvent(RaftEvent.EventType.SNAPSHOT_CREATED,
+                String.format("Created snapshot at index %d, compacted %d entries", lastIndex, entriesRemoved));
+        } catch (RuntimeException e) {
+            log.error("Failed to create snapshot", e);
+        }
+    }
+
+    private ClusterConfiguration configurationAt(int index) {
+        for (int i = index; i > snapshotIndex(); i--) {
+            LogEntry entry = raftLog.get(logicalToPhysical(i));
+            if (entry.isConfigurationEntry()) {
+                return entry.getConfiguration();
+            }
+        }
+        return lastSnapshot != null && lastSnapshot.getConfiguration() != null
+            ? lastSnapshot.getConfiguration()
+            : bootstrapConfiguration;
+    }
+
+    private void sendSnapshot(Peer peer) {
+        Snapshot snapshot = lastSnapshot;
+        log.info("Peer {} is behind the log, sending snapshot at index {}", peer.id, snapshot.getLastIncludedIndex());
+
+        InstallSnapshotRequest request = InstallSnapshotRequest.newBuilder()
+            .setTerm(currentTerm.get())
+            .setLeaderId(config.getNodeId())
+            .setLastIncludedIndex(snapshot.getLastIncludedIndex())
+            .setLastIncludedTerm(snapshot.getLastIncludedTerm())
+            .setData(ByteString.copyFrom(
+                RaftCodec.encodeSnapshot(snapshot.getStateMachineState(), snapshot.getConfiguration())))
+            .setDone(true)
+            .setOffset(0)
+            .build();
+
+        int sentTerm = currentTerm.get();
+        long sequence = rpcSequence;
+        peer.inFlight = true;
+        peer.resend = false;
+        peer.stub(config.getSnapshotRpcTimeoutMs()).installSnapshot(request, responseHandler(
+            response -> onInstallSnapshotResponse(peer, sentTerm, snapshot.getLastIncludedIndex(), sequence, response),
+            error -> onReplicationFailure(peer, "InstallSnapshot", error)));
+    }
+
+    private synchronized void onInstallSnapshotResponse(Peer peer, int sentTerm, int lastIncludedIndex,
+                                                        long sequence, InstallSnapshotResponse response) {
+        peer.inFlight = false;
+        if (response.getTerm() > currentTerm.get()) {
+            stepDown(response.getTerm());
+            return;
+        }
+        if (state != NodeState.LEADER || currentTerm.get() != sentTerm || peers.get(peer.id) != peer) {
+            return;
+        }
+        acknowledgeReads(peer.id, sequence);
+        if (response.getSuccess()) {
+            int match = Math.max(matchIndex.getOrDefault(peer.id, -1), lastIncludedIndex);
+            matchIndex.put(peer.id, match);
+            nextIndex.put(peer.id, match + 1);
+            advanceCommitIndex();
+            replicate(peer);
+        }
+    }
+
+    /**
+     * InstallSnapshot RPC (section 7): replaces the state of a follower that is too far behind.
+     */
+    public synchronized InstallSnapshotResponse handleInstallSnapshot(InstallSnapshotRequest request) {
+        if (request.getTerm() < currentTerm.get()) {
+            return installSnapshotResponse(false);
+        }
+        observeLeader(request.getTerm(), request.getLeaderId());
+
+        int lastIncludedIndex = request.getLastIncludedIndex();
+        int lastIncludedTerm = request.getLastIncludedTerm();
+        if (lastIncludedIndex <= commitIndex.get()) {
+            return installSnapshotResponse(true);
+        }
+
+        SnapshotData data;
+        try {
+            data = SnapshotData.parseFrom(request.getData());
+        } catch (InvalidProtocolBufferException e) {
+            log.error("Received corrupt snapshot from {}", request.getLeaderId(), e);
+            return installSnapshotResponse(false);
+        }
+
+        List<String> snapshotState = RaftCodec.decodeSnapshotState(data);
+        Snapshot snapshot = new Snapshot(lastIncludedIndex, lastIncludedTerm, snapshotState,
+            RaftCodec.decodeSnapshotConfiguration(data), System.currentTimeMillis(), request.getData().size());
+
+        persistenceService.saveSnapshot(config.getNodeId(), snapshot);
+
+        // Entries after the snapshot stay only if our log agrees with it at the snapshot's last entry
+        if (lastIncludedIndex <= lastLogIndex() && termAt(lastIncludedIndex) == lastIncludedTerm) {
+            persistenceService.compactLog(config.getNodeId(), lastIncludedIndex);
+            raftLog.subList(0, logicalToPhysical(lastIncludedIndex) + 1).clear();
+        } else {
+            persistenceService.deleteLogEntriesFrom(config.getNodeId(), 0);
+            raftLog.clear();
+        }
+
+        lastSnapshot = snapshot;
+        stateMachine.clear();
+        stateMachine.addAll(snapshotState);
+        commitIndex.set(lastIncludedIndex);
+        lastApplied.set(lastIncludedIndex);
+        reloadConfiguration();
+
+        logEvent(RaftEvent.EventType.SNAPSHOT_INSTALLED,
+            String.format("Installed snapshot from %s at index %d", request.getLeaderId(), lastIncludedIndex));
+        return installSnapshotResponse(true);
+    }
+
+    private InstallSnapshotResponse installSnapshotResponse(boolean success) {
+        return InstallSnapshotResponse.newBuilder()
+            .setTerm(currentTerm.get())
+            .setSuccess(success)
+            .build();
+    }
+
+    // ==================== Log Access ====================
+
+    private int appendToOwnLog(LogEntry entry) {
+        int index = lastLogIndex() + 1;
+        // Durable first: the leader counts itself towards the quorum for this entry
+        persistenceService.appendLogEntries(config.getNodeId(), index, List.of(entry));
+        raftLog.add(entry);
+        matchIndex.put(config.getNodeId(), index);
+        if (entry.isConfigurationEntry()) {
+            adoptConfiguration(entry.getConfiguration(), index);
+        }
+        return index;
+    }
+
+    private int snapshotIndex() {
+        return lastSnapshot != null ? lastSnapshot.getLastIncludedIndex() : -1;
+    }
+
+    /**
+     * The logical index of the first entry in raftLog.
+     */
+    private int getLogBaseIndex() {
+        return snapshotIndex() + 1;
+    }
+
+    private int logicalToPhysical(int logicalIndex) {
+        return logicalIndex - getLogBaseIndex();
+    }
+
+    private int lastLogIndex() {
+        return getLogBaseIndex() + raftLog.size() - 1;
+    }
+
+    /**
+     * The term of a logical index, or 0 if this node does not have that entry (terms start at 1).
+     */
+    private int termAt(int logicalIndex) {
+        if (lastSnapshot != null && logicalIndex == lastSnapshot.getLastIncludedIndex()) {
+            return lastSnapshot.getLastIncludedTerm();
+        }
+        int physicalIndex = logicalToPhysical(logicalIndex);
+        if (physicalIndex < 0 || physicalIndex >= raftLog.size()) {
+            return 0;
+        }
+        return raftLog.get(physicalIndex).getTerm();
+    }
+
+    // ==================== Monitoring ====================
+
+    public synchronized Map<String, Object> getStatus() {
+        Map<String, Object> status = new HashMap<>();
+        status.put("nodeId", config.getNodeId());
+        status.put("state", suspended ? "SUSPENDED" : state.name());
+        status.put("currentTerm", currentTerm.get());
+        status.put("currentLeader", currentLeader);
+        // Counts of entries, not indices: 0 means none, 1 means the entry at index 0, and so on
+        status.put("commitIndex", commitIndex.get() + 1);
+        status.put("lastApplied", lastApplied.get() + 1);
+        status.put("logSize", lastLogIndex() + 1);
+        status.put("stateMachine", new ArrayList<>(stateMachine));
+        status.put("suspended", suspended);
+        status.put("members", new TreeSet<>(configuration.getAllServers()));
+        status.put("member", configuration.contains(config.getNodeId()));
+        status.put("jointConsensus", configuration.isJoint());
+        status.put("hasSnapshot", lastSnapshot != null);
+        status.put("snapshotBaseIndex", lastSnapshot != null ? lastSnapshot.getLastIncludedIndex() : 0);
+        return status;
+    }
+
+    public synchronized Map<String, Map<String, Object>> getReplicationStatus() {
+        Map<String, Map<String, Object>> replication = new TreeMap<>();
+        int lastIndex = lastLogIndex();
+        for (String peerId : peers.keySet()) {
+            int match = matchIndex.getOrDefault(peerId, -1);
+            Map<String, Object> status = new HashMap<>();
+            status.put("nextIndex", nextIndex.getOrDefault(peerId, 0));
+            status.put("matchIndex", match);
+            status.put("lag", lastIndex - match);
+            status.put("upToDate", match >= lastIndex);
+            replication.put(peerId, status);
+        }
+        return replication;
+    }
+
+    /**
+     * The latest entries of the log with their logical indices, for inspecting the log from outside.
+     */
+    public synchronized Map<String, Object> getLogView(int limit) {
+        List<Map<String, Object>> entries = new ArrayList<>();
+        int first = Math.max(getLogBaseIndex(), lastLogIndex() - limit + 1);
+        for (int index = first; index <= lastLogIndex(); index++) {
+            LogEntry entry = raftLog.get(logicalToPhysical(index));
+            Map<String, Object> view = new HashMap<>();
+            view.put("index", index);
+            view.put("term", entry.getTerm());
+            if (entry.isConfigurationEntry()) {
+                view.put("type", "CONFIGURATION");
+                view.put("command", entry.getConfiguration().toString());
+            } else if (entry.getCommand() == null) {
+                view.put("type", "NOOP");
+            } else {
+                view.put("type", "COMMAND");
+                view.put("command", entry.getCommand());
+            }
+            entries.add(view);
+        }
         
-        logEvent(RaftEvent.EventType.STATE_CHANGE,
-            "Node RESUMED - Rejoining cluster as FOLLOWER");
-        
-        log.info("Node {} resumed successfully. Rejoining cluster.", config.getNodeId());
+        Map<String, Object> log = new HashMap<>();
+        log.put("entries", entries);
+        log.put("lastIndex", lastLogIndex());
+        log.put("commitIndex", commitIndex.get());
+        log.put("lastApplied", lastApplied.get());
+        log.put("snapshotIndex", snapshotIndex());
+        return log;
+    }
+    
+    public synchronized List<LogEntry> getRaftLog() {
+        return new ArrayList<>(raftLog);
+    }
+
+    public synchronized int getLastLogIndex() {
+        return lastLogIndex();
+    }
+
+    public int getCompactedEntries() {
+        return getLogBaseIndex();
+    }
+
+    public synchronized double getAverageCommitLatencyMs() {
+        return averageCommitLatencyMs;
+    }
+
+    public synchronized double getCommandsPerSecond() {
+        pruneRecentCommits(System.currentTimeMillis());
+        return recentCommits.size() / (THROUGHPUT_WINDOW_MS / 1000.0);
+    }
+
+    public synchronized long getLeaderUptimeMs() {
+        return state == NodeState.LEADER ? System.currentTimeMillis() - leaderSinceMillis : 0;
     }
 
     private void logEvent(RaftEvent.EventType type, String description) {
@@ -207,1485 +1263,74 @@ public class RaftNode {
             currentTerm.get(),
             config.getNodeId()
         );
-        
+
         synchronized (events) {
-            events.add(event);
-            while (events.size() > MAX_EVENTS) {
-                events.remove(0);
+            events.addLast(event);
+            if (events.size() > MAX_EVENTS) {
+                events.removeFirst();
             }
         }
-        
+
         log.info("[EVENT] {}", event.toLogString());
     }
-    
+
     public List<RaftEvent> getEvents() {
         synchronized (events) {
             return new ArrayList<>(events);
         }
     }
-    
-    private void startElectionTimer() {
+
+    private void cancelTimers() {
         if (electionTask != null) {
             electionTask.cancel(false);
+            electionTask = null;
         }
-        
-        int timeout = ThreadLocalRandom.current().nextInt(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX);
-        electionTask = scheduler.schedule(this::startElection, timeout, TimeUnit.MILLISECONDS);
-        log.debug("Election timer started: {}ms", timeout);
-    }
-    
-    private void startElection() {
-        if (suspended || state == NodeState.LEADER) {
-            return;
-        }
-        
-        // Pre-vote phase: Check if election would be successful before disrupting cluster
-        log.info("Starting pre-vote phase for node {}", config.getNodeId());
-        boolean preVoteSuccessful = performPreVote();
-        
-        if (!preVoteSuccessful) {
-            log.info("Pre-vote failed for node {}, not starting actual election", config.getNodeId());
-            startElectionTimer();
-            return;
-        }
-        
-        log.info("Pre-vote successful! Starting actual election...");
-        logEvent(RaftEvent.EventType.STATE_CHANGE,
-            "FOLLOWER → CANDIDATE");
-        state = NodeState.CANDIDATE;
-        currentTerm.incrementAndGet();
-        logEvent(RaftEvent.EventType.TERM_INCREASED,
-            "Term increased to " + currentTerm.get());
-        votedFor = config.getNodeId();
-        currentLeader = null;
-        
-        // Persist state change (CRITICAL for Raft safety - must persist before sending RequestVote RPCs)
-        persistenceService.saveState(config.getNodeId(), currentTerm.get(), votedFor);
-        
-        int votesReceived = 1;
-        int votesNeeded = (stubs.size() + 2) / 2; 
-        
-        log.info("Node {} starting election for term {}", config.getNodeId(), currentTerm.get());
-        logEvent(RaftEvent.EventType.ELECTION_START,
-            "Starting election, need " + votesNeeded + " votes");
-        
-        int lastLogIndex = getLastLogIndex();
-        int lastLogTerm = getLogTermAt(lastLogIndex);
-        
-        VoteRequest voteRequest = VoteRequest.newBuilder()
-            .setTerm(currentTerm.get())
-            .setCandidateId(config.getNodeId())
-            .setLastLogIndex(lastLogIndex)
-            .setLastLogTerm(lastLogTerm)
-            .build();
-
-        for (Map.Entry<String, RaftServiceGrpc.RaftServiceBlockingStub> entry : stubs.entrySet()) {
-            try {
-                VoteResponse response = entry.getValue().requestVote(voteRequest);
-                
-                if (response.getTerm() > currentTerm.get()) {
-                    becomeFollower(response.getTerm());
-                    return;
-                }
-                
-                if (response.getVoteGranted()) {
-                    votesReceived++;
-                    log.info("Received vote from {} ({}/{})", entry.getKey(), votesReceived, votesNeeded);
-                    logEvent(RaftEvent.EventType.VOTE_GRANTED,
-                        "Vote granted from " + entry.getKey() + " (" + votesReceived + "/" + votesNeeded + ")");
-                } else {
-                    logEvent(RaftEvent.EventType.VOTE_DENIED,
-                        "Vote denied from " + entry.getKey());
-                }
-            } catch (Exception e) {
-                log.warn("Failed to request vote from {}: {}", entry.getKey(), e.getMessage());
-            }
-        }
-        
-        if (votesReceived >= votesNeeded && state == NodeState.CANDIDATE) {
-            logEvent(RaftEvent.EventType.ELECTION_WON,
-                "Won election with " + votesReceived + " votes");
-            becomeLeader();
-        } else {
-            log.info("Election failed. Votes received: {}, needed: {}", votesReceived, votesNeeded);
-            logEvent(RaftEvent.EventType.ELECTION_LOST,
-                "Lost election: " + votesReceived + "/" + votesNeeded + " votes");
-            startElectionTimer();
-        }
-    }
-    
-    private void becomeLeader() {
-        log.info("Node {} became LEADER for term {}", config.getNodeId(), currentTerm.get());
-        logEvent(RaftEvent.EventType.STATE_CHANGE,
-            "CANDIDATE → LEADER");
-        state = NodeState.LEADER;
-        currentLeader = config.getNodeId();
-
-        // Initialize nextIndex for each peer to leader's last log index + 1 (logical index)
-        int lastLogIndexPlusOne = getLastLogIndex() + 1;
-        for (String peerId : stubs.keySet()) {
-            nextIndex.put(peerId, lastLogIndexPlusOne);
-            matchIndex.put(peerId, -1);  // -1 = follower has no entries replicated yet
-        }
-        
-        // Leader implicitly has all its own log entries replicated
-        // This allows the first entry to be committed immediately once majority confirms
-        matchIndex.put(config.getNodeId(), getLastLogIndex());
-        
         if (heartbeatTask != null) {
             heartbeatTask.cancel(false);
+            heartbeatTask = null;
         }
-        heartbeatTask = scheduler.scheduleAtFixedRate(this::sendHeartbeats, 0, HEARTBEAT_INTERVAL, TimeUnit.MILLISECONDS);
-        
-        if (electionTask != null) {
-            electionTask.cancel(false);
-        }
+        electionTimerGeneration++;
     }
-    
-    private void becomeFollower(int newTerm) {
-        log.info("Node {} becoming FOLLOWER for term {}", config.getNodeId(), newTerm);
-        String oldState = state.toString();
-        logEvent(RaftEvent.EventType.STATE_CHANGE,
-            oldState + " → FOLLOWER");
-        if (newTerm > currentTerm.get()) {
-            logEvent(RaftEvent.EventType.TERM_INCREASED,
-                "Term increased to " + newTerm);
-        }
-        state = NodeState.FOLLOWER;
-        currentTerm.set(newTerm);
-        votedFor = null;
-        
-        // Persist state change (CRITICAL for Raft safety)
-        persistenceService.saveState(config.getNodeId(), newTerm, null);
-        
-        if (heartbeatTask != null) {
-            heartbeatTask.cancel(false);
-        }
-        
-        startElectionTimer();
-    }
-    
-    private void sendHeartbeats() {
-        if (state != NodeState.LEADER) {
-            return;
-        }
-        
-        for (Map.Entry<String, RaftServiceGrpc.RaftServiceBlockingStub> entry : stubs.entrySet()) {
-            String peerId = entry.getKey();
-            RaftServiceGrpc.RaftServiceBlockingStub stub = entry.getValue();
-            
-            int peerNextIndex = nextIndex.getOrDefault(peerId, getLogBaseIndex());
-            
-            // Check if follower is too far behind and needs snapshot
-            if (lastSnapshot != null && peerNextIndex <= lastSnapshot.getLastIncludedIndex()) {
-                log.info("Follower {} is too far behind (nextIndex={}, snapshotIndex={}), sending snapshot",
-                        peerId, peerNextIndex, lastSnapshot.getLastIncludedIndex());
-                try {
-                    boolean success = sendInstallSnapshot(peerId);
-                    if (success) {
-                        log.info("Successfully sent snapshot to {}", peerId);
-                    }
-                } catch (Exception e) {
-                    log.error("Failed to send snapshot to {}: {}", peerId, e.getMessage());
-                }
-                continue;  // Skip AppendEntries for this peer
+
+    private static <T> StreamObserver<T> responseHandler(Consumer<T> onResponse, Consumer<Throwable> onFailure) {
+        return new StreamObserver<>() {
+            @Override
+            public void onNext(T response) {
+                onResponse.accept(response);
             }
-            
-            int prevLogIndex = peerNextIndex - 1;
-            int prevLogTerm;
-            
-            if (prevLogIndex < 0) {
-                prevLogTerm = 0;
-            } else if (lastSnapshot != null && prevLogIndex == lastSnapshot.getLastIncludedIndex()) {
-                prevLogTerm = lastSnapshot.getLastIncludedTerm();
-            } else {
-                prevLogTerm = getLogTermAt(prevLogIndex);
+
+            @Override
+            public void onError(Throwable error) {
+                onFailure.accept(error);
             }
-            
-            List<GrpcLogEntry> entries = new ArrayList<>();
-            int startPhysicalIndex = logicalToPhysical(peerNextIndex);
-            for (int i = Math.max(0, startPhysicalIndex); i < raftLog.size(); i++) {
-                LogEntry entry1 = raftLog.get(i);
-                entries.add(convertToGrpcLogEntry(entry1));
+
+            @Override
+            public void onCompleted() {
             }
-            
-            AppendEntriesRequest request = AppendEntriesRequest.newBuilder()
-                .setTerm(currentTerm.get())
-                .setLeaderId(config.getNodeId())
-                .setPrevLogIndex(prevLogIndex)
-                .setPrevLogTerm(prevLogTerm)
-                .addAllEntries(entries)
-                .setLeaderCommit(commitIndex.get())
-                .build();
-            
-            try {
-                AppendEntriesResponse response = stub.appendEntries(request);
-                
-                if (response.getTerm() > currentTerm.get()) {
-                    becomeFollower(response.getTerm());
-                    return;
-                }
-                
-                if (response.getSuccess()) {
-                    if (!entries.isEmpty()) {
-                        // Update match and next indices (logical indices)
-                        int newMatchIndex = prevLogIndex + entries.size();
-                        int newNextIndex = newMatchIndex + 1;
-                        matchIndex.put(peerId, newMatchIndex);
-                        nextIndex.put(peerId, newNextIndex);
-                        updateCommitIndex();
-                        applyCommittedEntries();
-                    }
-                } else {
-                    // Decrement nextIndex but don't go below base index
-                    int baseIndex = getLogBaseIndex();
-                    nextIndex.put(peerId, Math.max(baseIndex, peerNextIndex - 1));
-                }
-            } catch (Exception e) {
-                log.debug("Failed to send AppendEntries to {}: {}", peerId, e.getMessage());
-            }
-        }
-        
-        // After sending to all followers, update commit index based on majority
-        // This ensures we commit as soon as majority has replicated
-        updateCommitIndex();
+        };
     }
-    
-    private void updateCommitIndex() {
-        if (state != NodeState.LEADER) {
-            return;
+
+    private static final class Peer {
+        final String id;
+        final ManagedChannel channel;
+        final RaftServiceGrpc.RaftServiceStub stub;
+        boolean inFlight = false;
+        boolean resend = false;
+
+        Peer(String id, ManagedChannel channel) {
+            this.id = id;
+            this.channel = channel;
+            this.stub = RaftServiceGrpc.newStub(channel);
         }
-        
-        // Collect match indices (logical indices) from all peers + self
-        // Note: matchIndex now includes the leader's own nodeId
-        List<Integer> indices = new ArrayList<>(matchIndex.values());
-        Collections.sort(indices, Collections.reverseOrder());
-        
-        // Find the majority index (median)
-        // Total nodes = stubs.size() (peers) + 1 (self)
-        // Majority position = totalNodes / 2 (0-indexed, so this gives us the median)
-        int totalNodes = stubs.size() + 1;
-        int majorityPosition = totalNodes / 2;
-        
-        if (majorityPosition < indices.size()) {
-            int newCommitIndex = indices.get(majorityPosition);
-            
-            // Only commit entries from current term (Raft safety requirement)
-            // Also skip if newCommitIndex is -1 (no entries replicated yet)
-            if (newCommitIndex >= 0 && newCommitIndex > commitIndex.get() && getLogTermAt(newCommitIndex) == currentTerm.get()) {
-                commitIndex.set(newCommitIndex);
-                log.debug("Updated commit index to {} (logical)", newCommitIndex);
-                applyCommittedEntries();
-            }
+
+        RaftServiceGrpc.RaftServiceStub stub(long timeoutMs) {
+            return stub.withDeadlineAfter(timeoutMs, TimeUnit.MILLISECONDS);
         }
     }
-    
-    private void applyCommittedEntries() {
-        // Apply entries from lastApplied+1 to commitIndex (both logical indices)
-        while (lastApplied.get() < commitIndex.get()) {
-            int logicalIndexToApply = lastApplied.get() + 1;
-            int physicalIndex = logicalToPhysical(logicalIndexToApply);
-            
-            if (physicalIndex >= 0 && physicalIndex < raftLog.size()) {
-                LogEntry entry = raftLog.get(physicalIndex);
-                
-                // Check if this is a configuration entry
-                if (entry.isConfigurationEntry()) {
-                    applyConfigurationEntry(entry, logicalIndexToApply);
-                } else if (entry.getCommand() != null) {
-                    // Regular command entry (skip if command is null)
-                    stateMachine.add(entry.getCommand());
-                    log.debug("Applied entry at logical index {} to state machine: {}", logicalIndexToApply, entry.getCommand());
-                }
-            }
-            lastApplied.set(logicalIndexToApply);
-        }
-        
-        // Check if we should create a snapshot
-        checkSnapshotThreshold();
+
+    private record PendingCommand(CompletableFuture<CommandResult> result, long startMillis) {
     }
-    
-    /**
-     * Apply a configuration change entry.
-     * When C_old,new is committed, we add C_new to the log.
-     */
-    private void applyConfigurationEntry(LogEntry entry, int index) {
-        ClusterConfiguration config = entry.getConfiguration();
-        
-        log.info("Applying configuration entry at index {}: {}", index, config);
-        
-        if (config.isJoint()) {
-            // C_old,new has been committed
-            // Now add C_new configuration entry (only leader does this)
-            // BUT: Only if we haven't already added it!
-            if (state == NodeState.LEADER) {
-                // Check if C_new already exists in the log after this entry
-                boolean cNewExists = false;
-                for (int i = index + 1; i < raftLog.size(); i++) {
-                    LogEntry nextEntry = raftLog.get(i);
-                    if (nextEntry.isConfigurationEntry() && !nextEntry.getConfiguration().isJoint()) {
-                        cNewExists = true;
-                        break;
-                    }
-                }
-                
-                if (!cNewExists) {
-                    Set<String> newServers = config.getNewServers();
-                    
-                    ClusterConfiguration newConfig =
-                        ClusterConfiguration.createNew(newServers);
-                    
-                    LogEntry newConfigEntry =
-                        new LogEntry(currentTerm.get(), null, newConfig);
-                    
-                    raftLog.add(newConfigEntry);
-                    
-                    logEvent(RaftEvent.EventType.MEMBERSHIP_CHANGE_COMMITTED, 
-                        "C_old,new committed. Added C_new configuration to log");
-                    
-                    sendHeartbeats();
-                } else {
-                    log.debug("C_new already exists in log, skipping duplicate creation");
-                }
-            }
-        } else {
-            // C_new has been committed
-            // Finalize the configuration change
-            Set<String> newServers = config.getNewServers();
-            Set<String> oldServers = new HashSet<>(stubs.keySet());
-            oldServers.add(this.config.getNodeId());
-            
-            // Disconnect from removed servers
-            for (String nodeId : oldServers) {
-                if (!newServers.contains(nodeId) && !nodeId.equals(this.config.getNodeId())) {
-                    disconnectFromServer(nodeId);
-                    logEvent(RaftEvent.EventType.MEMBERSHIP_CHANGE_COMMITTED,
-                        "C_new committed. Disconnected from removed server: " + nodeId);
-                }
-            }
-            
-            log.info("Configuration change finalized. New cluster: {}", newServers);
-        }
-    }
-    
-    /**
-     * Disconnect from a server and clean up resources.
-     */
-    private void disconnectFromServer(String nodeId) {
-        ManagedChannel channel = channels.remove(nodeId);
-        if (channel != null) {
-            channel.shutdown();
-            log.info("Disconnected from server: {}", nodeId);
-        }
-        stubs.remove(nodeId);
-        nextIndex.remove(nodeId);
-        matchIndex.remove(nodeId);
-    }
-    
-    public VoteResponse handleVoteRequest(VoteRequest request) {
-        log.info("Received vote request from {} for term {}", request.getCandidateId(), request.getTerm());
-        
-        // Deny votes when suspended
-        if (suspended) {
-            log.info("Denying vote request - node is suspended");
-            return VoteResponse.newBuilder()
-                .setTerm(currentTerm.get())
-                .setVoteGranted(false)
-                .build();
-        }
-        
-        if (request.getTerm() > currentTerm.get()) {
-            becomeFollower(request.getTerm());
-        }
-        
-        boolean voteGranted = false;
-        
-        if (request.getTerm() < currentTerm.get()) {
-            voteGranted = false;
-            logEvent(RaftEvent.EventType.VOTE_DENIED, 
-                "Denied vote to " + request.getCandidateId() + " (stale term " + request.getTerm() + ")");
-        } else if (votedFor == null || votedFor.equals(request.getCandidateId())) {
-            int lastLogIndex = getLastLogIndex();
-            int lastLogTerm = getLogTermAt(lastLogIndex);
-            
-            boolean logUpToDate = request.getLastLogTerm() > lastLogTerm ||
-                (request.getLastLogTerm() == lastLogTerm && request.getLastLogIndex() >= lastLogIndex);
-            
-            if (logUpToDate) {
-                votedFor = request.getCandidateId();
-                voteGranted = true;
-                lastHeartbeat = System.currentTimeMillis();
-                
-                // Persist vote (CRITICAL for Raft safety - must persist before responding)
-                persistenceService.saveState(config.getNodeId(), currentTerm.get(), votedFor);
-                
-                startElectionTimer();
-                log.info("Voted for {}", request.getCandidateId());
-                logEvent(RaftEvent.EventType.VOTE_GRANTED, 
-                    "Granted vote to " + request.getCandidateId() + " for term " + request.getTerm());
-            } else {
-                logEvent(RaftEvent.EventType.VOTE_DENIED, 
-                    "Denied vote to " + request.getCandidateId() + " (log not up-to-date)");
-            }
-        } else {
-            logEvent(RaftEvent.EventType.VOTE_DENIED, 
-                "Denied vote to " + request.getCandidateId() + " (already voted for " + votedFor + ")");
-        }
-        
-        return VoteResponse.newBuilder()
-            .setTerm(currentTerm.get())
-            .setVoteGranted(voteGranted)
-            .build();
-    }
-    
-    public AppendEntriesResponse handleAppendEntries(AppendEntriesRequest request) {
-        // Reject AppendEntries when suspended
-        if (suspended) {
-            log.debug("Rejecting AppendEntries - node is suspended");
-            return AppendEntriesResponse.newBuilder()
-                .setTerm(currentTerm.get())
-                .setSuccess(false)
-                .build();
-        }
-        
-        lastHeartbeat = System.currentTimeMillis();
-        
-        if (request.getTerm() > currentTerm.get()) {
-            becomeFollower(request.getTerm());
-        }
-        
-        if (request.getTerm() < currentTerm.get()) {
-            return AppendEntriesResponse.newBuilder()
-                .setTerm(currentTerm.get())
-                .setSuccess(false)
-                .build();
-        }
-        
-        if (state != NodeState.FOLLOWER) {
-            becomeFollower(request.getTerm());
-        }
-        
-        currentLeader = request.getLeaderId();
-        startElectionTimer();
-        
-        if (request.getEntriesCount() == 0) {
-            logEvent(RaftEvent.EventType.HEARTBEAT_RECEIVED, 
-                "Heartbeat from leader " + request.getLeaderId());
-        }
-        
-        // Check prevLogIndex/prevLogTerm consistency (logical indices)
-        int prevLogIndex = request.getPrevLogIndex();
-        if (prevLogIndex >= 0) {
-            // Check if we have the entry at prevLogIndex
-            int prevLogTerm = getLogTermAt(prevLogIndex);
-            
-            if (prevLogTerm == 0 || prevLogTerm != request.getPrevLogTerm()) {
-                log.debug("Log consistency check failed at index {}: expected term {}, got {}", 
-                         prevLogIndex, request.getPrevLogTerm(), prevLogTerm);
-                return AppendEntriesResponse.newBuilder()
-                    .setTerm(currentTerm.get())
-                    .setSuccess(false)
-                    .build();
-            }
-        }
-        
-        // Process new entries (logical indices)
-        int newEntryLogicalIndex = prevLogIndex + 1;
-        int entriesAdded = 0;
-        List<LogEntry> entriesToPersist = new ArrayList<>();
-        
-        for (GrpcLogEntry entry : request.getEntriesList()) {
-            int physicalIndex = logicalToPhysical(newEntryLogicalIndex);
-            
-            // Check for conflicts
-            if (physicalIndex >= 0 && physicalIndex < raftLog.size()) {
-                if (raftLog.get(physicalIndex).getTerm() != entry.getTerm()) {
-                    // Conflict detected - delete conflicting entries
-                    synchronized (raftLog) {
-                        raftLog.subList(physicalIndex, raftLog.size()).clear();
-                        
-                        // Persist log deletion (CRITICAL for consistency)
-                        persistenceService.deleteLogEntriesFrom(config.getNodeId(), newEntryLogicalIndex);
-                    }
-                }
-            }
-            
-            // Append if we don't have this entry
-            physicalIndex = logicalToPhysical(newEntryLogicalIndex);
-            if (physicalIndex >= raftLog.size()) {
-                // Convert gRPC entry back to internal LogEntry
-                LogEntry logEntry = convertFromGrpcLogEntry(entry);
-                synchronized (raftLog) {
-                    raftLog.add(logEntry);
-                }
-                entriesToPersist.add(logEntry);
-                entriesAdded++;
-            }
-            newEntryLogicalIndex++;
-        }
-        
-        // Persist all new entries in batch (CRITICAL for durability)
-        if (!entriesToPersist.isEmpty()) {
-            int startLogicalIndex = prevLogIndex + 1;
-            persistenceService.appendLogEntries(config.getNodeId(), startLogicalIndex, entriesToPersist);
-        }
-        
-        if (entriesAdded > 0) {
-            logEvent(RaftEvent.EventType.LOG_REPLICATED, 
-                "Replicated " + entriesAdded + " entries from leader " + request.getLeaderId());
-        }
-        
-        // Update commit index based on leader's commit index (logical indices)
-        if (request.getLeaderCommit() > commitIndex.get()) {
-            commitIndex.set(Math.min(request.getLeaderCommit(), getLastLogIndex()));
-            applyCommittedEntries();
-        }
-        
-        return AppendEntriesResponse.newBuilder()
-            .setTerm(currentTerm.get())
-            .setSuccess(true)
-            .setMatchIndex(getLastLogIndex())  // Logical index of last entry
-            .build();
-    }
-    
-    public boolean submitCommand(String command) {
-        if (suspended) {
-            log.warn("Cannot submit command - node is suspended");
-            return false;
-        }
-        
-        if (state != NodeState.LEADER) {
-            log.warn("Not a leader, cannot submit command");
-            return false;
-        }
-        
-        log.info("Leader received command: {}", command);
-        logEvent(RaftEvent.EventType.COMMAND_RECEIVED, 
-            "Received command from client: " + command);
-        
-        LogEntry entry = new LogEntry(currentTerm.get(), command);
-        synchronized (raftLog) {
-            raftLog.add(entry);
-            
-            // Persist log entry (CRITICAL for durability)
-            int logicalIndex = getLastLogIndex();
-            persistenceService.appendLogEntry(config.getNodeId(), logicalIndex, entry);
-            
-            // Leader has this entry immediately replicated on itself
-            matchIndex.put(config.getNodeId(), logicalIndex);
-        }
-        
-        sendHeartbeats();
-        
-        return true;
-    }
-    
-    /**
-     * Add a server to the cluster (membership change).
-     * Uses the two-phase approach from the Raft paper:
-     * 1. Add C_old,new configuration
-     * 2. After it's committed, add C_new configuration
-     */
-    public synchronized boolean addServer(ServerInfo serverInfo) {
-        if (state != NodeState.LEADER) {
-            log.warn("Not a leader, cannot add server");
-            return false;
-        }
-        
-        log.info("Leader initiating server addition: {}", serverInfo);
-        logEvent(RaftEvent.EventType.SERVER_ADDED, 
-            "Initiating addition of server: " + serverInfo.getNodeId());
-        
-        // Create joint consensus configuration C_old,new
-        Set<String> oldServers = new HashSet<>(stubs.keySet());
-        oldServers.add(config.getNodeId()); // Include self
-        
-        Set<String> newServers = new HashSet<>(oldServers);
-        newServers.add(serverInfo.getNodeId());
-        
-        ClusterConfiguration jointConfig =
-            ClusterConfiguration.createJoint(oldServers, newServers);
-        
-        // Add C_old,new to log
-        LogEntry configEntry =
-            new LogEntry(currentTerm.get(), null, jointConfig);
-        raftLog.add(configEntry);
-        
-        logEvent(RaftEvent.EventType.MEMBERSHIP_CHANGE_START, 
-            "Added C_old,new configuration entry to log");
-        
-        // Connect to new server
-        try {
-            ManagedChannel channel = ManagedChannelBuilder
-                .forAddress(serverInfo.getHost(), serverInfo.getGrpcPort())
-                .usePlaintext()
-                .build();
-            channels.put(serverInfo.getNodeId(), channel);
-            stubs.put(serverInfo.getNodeId(), RaftServiceGrpc.newBlockingStub(channel));
-            nextIndex.put(serverInfo.getNodeId(), raftLog.size());
-            matchIndex.put(serverInfo.getNodeId(), 0);  // COUNT-based: 0 = new server has no entries replicated yet
-            log.info("Connected to new server: {}", serverInfo);
-        } catch (Exception e) {
-            log.error("Failed to connect to new server: {}", serverInfo, e);
-            return false;
-        }
-        
-        sendHeartbeats();
-        
-        return true;
-    }
-    
-    /**
-     * Remove a server from the cluster (membership change).
-     */
-    public synchronized boolean removeServer(String nodeId) {
-        if (state != NodeState.LEADER) {
-            log.warn("Not a leader, cannot remove server");
-            return false;
-        }
-        
-        if (nodeId.equals(config.getNodeId())) {
-            log.warn("Cannot remove self from cluster");
-            return false;
-        }
-        
-        log.info("Leader initiating server removal: {}", nodeId);
-        logEvent(RaftEvent.EventType.SERVER_REMOVED, 
-            "Initiating removal of server: " + nodeId);
-        
-        // Create joint consensus configuration C_old,new
-        Set<String> oldServers = new HashSet<>(stubs.keySet());
-        oldServers.add(config.getNodeId()); // Include self
-        
-        Set<String> newServers = new HashSet<>(oldServers);
-        newServers.remove(nodeId);
-        
-        ClusterConfiguration jointConfig =
-            ClusterConfiguration.createJoint(oldServers, newServers);
-        
-        // Add C_old,new to log
-        LogEntry configEntry =
-            new LogEntry(currentTerm.get(), null, jointConfig);
-        raftLog.add(configEntry);
-        
-        logEvent(RaftEvent.EventType.MEMBERSHIP_CHANGE_START, 
-            "Added C_old,new configuration entry to log");
-        
-        sendHeartbeats();
-        
-        return true;
-    }
-    
-    /**
-     * Get the current cluster configuration.
-     */
-    public Set<String> getClusterMembers() {
-        Set<String> members = new HashSet<>(stubs.keySet());
-        members.add(config.getNodeId());
-        return members;
-    }
-    
-    public Map<String, Object> getStatus() {
-        Map<String, Object> status = new HashMap<>();
-        status.put("nodeId", config.getNodeId());
-        status.put("state", suspended ? "SUSPENDED" : state.name());
-        status.put("currentTerm", currentTerm.get());
-        status.put("currentLeader", currentLeader);
-        // Display commitIndex as COUNT of committed entries (not index)
-        // Internal: -1 = nothing committed, 0 = 1 entry committed, etc.
-        // Display: 0 = nothing committed, 1 = 1 entry committed, etc.
-        status.put("commitIndex", commitIndex.get() + 1);
-        status.put("lastApplied", lastApplied.get() + 1);
-        // Return logical log size: total entries including those in snapshot
-        int logicalLogSize = getLogBaseIndex() + raftLog.size();
-        status.put("logSize", logicalLogSize);
-        status.put("stateMachine", new ArrayList<>(stateMachine));
-        status.put("suspended", suspended);
-        
-        // Add snapshot information for correct state machine indexing
-        if (lastSnapshot != null) {
-            status.put("snapshotBaseIndex", lastSnapshot.getLastIncludedIndex());
-            status.put("hasSnapshot", true);
-        } else {
-            status.put("snapshotBaseIndex", 0);
-            status.put("hasSnapshot", false);
-        }
-        
-        return status;
-    }
-    
-    /**
-     * Convert internal LogEntry to gRPC LogEntry for network transmission.
-     */
-    private GrpcLogEntry convertToGrpcLogEntry(LogEntry entry) {
-        GrpcLogEntry.Builder builder = GrpcLogEntry.newBuilder()
-            .setTerm(entry.getTerm());
-        
-        // Set command if present
-        if (entry.getCommand() != null) {
-            builder.setCommand(entry.getCommand());
-        }
-        
-        // Set configuration if this is a configuration entry
-        if (entry.isConfigurationEntry() && entry.getConfiguration() != null) {
-            builder.setConfiguration(convertToGrpcConfiguration(entry.getConfiguration()));
-        }
-        
-        return builder.build();
-    }
-    
-    /**
-     * Convert gRPC LogEntry back to internal LogEntry.
-     */
-    private LogEntry convertFromGrpcLogEntry(GrpcLogEntry grpcEntry) {
-        // Check if this is a configuration entry
-        if (grpcEntry.hasConfiguration()) {
-            ClusterConfiguration config = convertFromGrpcConfiguration(grpcEntry.getConfiguration());
-            return new LogEntry(grpcEntry.getTerm(), null, config);
-        } else {
-            // Regular command entry
-            String command = grpcEntry.getCommand();
-            if (command != null && command.isEmpty()) {
-                command = null; // Treat empty string as null
-            }
-            return new LogEntry(grpcEntry.getTerm(), command);
-        }
-    }
-    
-    /**
-     * Convert ClusterConfiguration to gRPC ConfigurationEntry.
-     */
-    private com.example.raftimplementation.grpc.ConfigurationEntry convertToGrpcConfiguration(
-            ClusterConfiguration config) {
-        com.example.raftimplementation.grpc.ConfigurationEntry.Builder builder = 
-            com.example.raftimplementation.grpc.ConfigurationEntry.newBuilder()
-                .setIsJoint(config.isJoint());
-        
-        // Add old servers - just nodeIds since we don't have full ServerInfo
-        for (String nodeId : config.getOldServers()) {
-            builder.addOldServers(
-                com.example.raftimplementation.grpc.ServerEntry.newBuilder()
-                    .setNodeId(nodeId)
-                    .setHost("") // Unknown in this context
-                    .setGrpcPort(0)
-                    .setHttpPort(0)
-                    .build()
-            );
-        }
-        
-        // Add new servers
-        for (String nodeId : config.getNewServers()) {
-            builder.addNewServers(
-                com.example.raftimplementation.grpc.ServerEntry.newBuilder()
-                    .setNodeId(nodeId)
-                    .setHost("") // Unknown in this context
-                    .setGrpcPort(0)
-                    .setHttpPort(0)
-                    .build()
-            );
-        }
-        
-        return builder.build();
-    }
-    
-    /**
-     * Convert gRPC ConfigurationEntry back to ClusterConfiguration.
-     */
-    private ClusterConfiguration convertFromGrpcConfiguration(
-            com.example.raftimplementation.grpc.ConfigurationEntry grpcConfig) {
-        Set<String> oldServers = new HashSet<>();
-        for (com.example.raftimplementation.grpc.ServerEntry server : grpcConfig.getOldServersList()) {
-            oldServers.add(server.getNodeId());
-        }
-        
-        Set<String> newServers = new HashSet<>();
-        for (com.example.raftimplementation.grpc.ServerEntry server : grpcConfig.getNewServersList()) {
-            newServers.add(server.getNodeId());
-        }
-        
-        if (grpcConfig.getIsJoint()) {
-            return ClusterConfiguration.createJoint(oldServers, newServers);
-        } else {
-            return ClusterConfiguration.createNew(newServers);
-        }
-    }
-    
-    /**
-     * Create a snapshot of the current state machine.
-     * This is used for log compaction to prevent unbounded log growth.
-     */
-    public synchronized void createSnapshot() {
-        if (raftLog.isEmpty()) {
-            log.debug("Cannot create snapshot: log is empty");
-            return;
-        }
-        
-        int lastIndex = lastApplied.get();
-        if (lastIndex <= 0) {
-            log.debug("Cannot create snapshot: no entries applied yet");
-            return;
-        }
-        
-        // Don't create snapshot if we already have a recent one
-        if (lastSnapshot != null && lastIndex <= lastSnapshot.getLastIncludedIndex()) {
-            log.debug("Snapshot already exists for index {}", lastIndex);
-            return;
-        }
-        
-        try {
-            // Get the term of the last applied entry (lastIndex is logical)
-            int lastTerm = getLogTermAt(lastIndex);
-            
-            // Copy state machine state
-            List<String> stateCopy = new ArrayList<>(stateMachine);
-            
-            // Find current configuration
-            ClusterConfiguration currentConfig = findCurrentConfiguration();
-            
-            // Calculate size
-            long sizeBytes = estimateSnapshotSize(stateCopy);
-            
-            // Create snapshot
-            Snapshot snapshot = new Snapshot(
-                lastIndex,
-                lastTerm,
-                stateCopy,
-                currentConfig,
-                System.currentTimeMillis(),
-                sizeBytes
-            );
-            
-            // Update snapshot state
-            lastSnapshot = snapshot;
-            totalSnapshots.incrementAndGet();
-            
-            // Persist snapshot (CRITICAL for recovery after compaction)
-            persistenceService.saveSnapshot(config.getNodeId(), snapshot);
-            
-            // Compact the log: remove entries up to lastIndex
-            int entriesRemoved = compactLog(lastIndex);
-            compactedEntries.addAndGet(entriesRemoved);
-            
-            // Persist log compaction (delete old entries from database)
-            persistenceService.compactLog(config.getNodeId(), lastIndex);
-            
-            log.info("Created snapshot at index {} (term {}), compacted {} entries, size: {} bytes",
-                lastIndex, lastTerm, entriesRemoved, sizeBytes);
-            
-            logEvent(RaftEvent.EventType.SNAPSHOT_CREATED,
-                String.format("Created snapshot at index %d, compacted %d entries", lastIndex, entriesRemoved));
-            
-        } catch (Exception e) {
-            log.error("Failed to create snapshot", e);
-        }
-    }
-    
-    /**
-     * Compact the log by removing entries up to AND INCLUDING the snapshot index.
-     * After snapshot at index N, we only keep entries from index N+1 onwards.
-     * Returns the number of entries removed.
-     */
-    private int compactLog(int snapshotIndex) {
-        if (snapshotIndex <= 0 || raftLog.isEmpty()) {
-            return 0;
-        }
-        
-        // Calculate how many entries to remove based on current baseIndex
-        
-        // If we don't have a snapshot yet, base is 0, so we remove entries 0..snapshotIndex (inclusive)
-        // If we already have a snapshot, we need to calculate physical positions
-        int physicalIndexOfSnapshot = logicalToPhysical(snapshotIndex);
-        
-        // Remove all entries up to and including the snapshot index
-        // After snapshot at index N, first entry should be at logical index N+1
-        int toRemove = physicalIndexOfSnapshot + 1;
-        toRemove = Math.max(0, Math.min(toRemove, raftLog.size()));
-        
-        synchronized (raftLog) {
-            for (int i = 0; i < toRemove; i++) {
-                raftLog.remove(0); // Always remove first element
-            }
-        }
-        
-        return toRemove;
-    }
-    
-    /**
-     * Get the base index - the logical index of the first entry in raftLog.
-     * If we have a snapshot, baseIndex = lastIncludedIndex + 1
-     * Otherwise, baseIndex = 0
-     */
-    private int getLogBaseIndex() {
-        return lastSnapshot != null ? lastSnapshot.getLastIncludedIndex() + 1 : 0;
-    }
-    
-    /**
-     * Convert logical index to physical index in raftLog array.
-     * Logical index: absolute position (0, 1, 2, 3, ...)
-     * Physical index: position in raftLog array after compaction
-     * 
-     * Example: If snapshot at index 10, raftLog[0] is logically at index 11
-     */
-    private int logicalToPhysical(int logicalIndex) {
-        return logicalIndex - getLogBaseIndex();
-    }
-    
-    /**
-     * Convert physical index in raftLog array to logical index.
-     */
-    private int physicalToLogical(int physicalIndex) {
-        return physicalIndex + getLogBaseIndex();
-    }
-    
-    /**
-     * Get the last log index (logical).
-     */
-    private int getLastLogIndex() {
-        if (raftLog.isEmpty()) {
-            return lastSnapshot != null ? lastSnapshot.getLastIncludedIndex() : -1;
-        }
-        return physicalToLogical(raftLog.size() - 1);
-    }
-    
-    /**
-     * Get the term at a logical index.
-     * Returns 0 if index is before snapshot, or snapshot term if at snapshot boundary.
-     */
-    private int getLogTermAt(int logicalIndex) {
-        if (lastSnapshot != null && logicalIndex == lastSnapshot.getLastIncludedIndex()) {
-            return lastSnapshot.getLastIncludedTerm();
-        }
-        
-        int physicalIndex = logicalToPhysical(logicalIndex);
-        if (physicalIndex < 0 || physicalIndex >= raftLog.size()) {
-            return 0;
-        }
-        
-        return raftLog.get(physicalIndex).getTerm();
-    }
-    
-    /**
-     * Find the current cluster configuration from the log.
-     */
-    private ClusterConfiguration findCurrentConfiguration() {
-        // Search backwards through log for most recent configuration
-        for (int i = raftLog.size() - 1; i >= 0; i--) {
-            LogEntry entry = raftLog.get(i);
-            if (entry.isConfigurationEntry()) {
-                return entry.getConfiguration();
-            }
-        }
-        
-        // If no configuration found, create default from current peers
-        Set<String> currentServers = new HashSet<>(stubs.keySet());
-        currentServers.add(config.getNodeId());
-        return ClusterConfiguration.createNew(currentServers);
-    }
-    
-    /**
-     * Estimate the size of a snapshot in bytes.
-     */
-    private long estimateSnapshotSize(List<String> state) {
-        // Rough estimate: each string averages 50 bytes
-        return state.size() * 50L;
-    }
-    
-    /**
-     * Check if we should create a snapshot based on log size.
-     */
-    private void checkSnapshotThreshold() {
-        int logSize = raftLog.size();
-        int appliedCount = lastApplied.get();
-        
-        // Create snapshot if we have enough applied entries
-        if (logSize >= SNAPSHOT_THRESHOLD && appliedCount >= SNAPSHOT_THRESHOLD / 2) {
-            log.info("Log size ({}) reached snapshot threshold ({}), creating snapshot", 
-                logSize, SNAPSHOT_THRESHOLD);
-            createSnapshot();
-        }
-    }
-    
-    /**
-     * Install a snapshot received from the leader.
-     * This is used when a follower is too far behind.
-     */
-    public synchronized void installSnapshot(Snapshot snapshot) {
-        if (snapshot == null) {
-            log.warn("Cannot install null snapshot");
-            return;
-        }
-        
-        // Verify snapshot is newer than our current one
-        if (lastSnapshot != null && snapshot.getLastIncludedIndex() <= lastSnapshot.getLastIncludedIndex()) {
-            log.debug("Ignoring older snapshot (index {})", snapshot.getLastIncludedIndex());
-            return;
-        }
-        
-        log.info("Installing snapshot at index {} (term {})", 
-            snapshot.getLastIncludedIndex(), snapshot.getLastIncludedTerm());
-        
-        // Discard entire log if snapshot is more recent
-        if (snapshot.getLastIncludedIndex() >= raftLog.size()) {
-            raftLog.clear();
-        } else {
-            // Keep only log entries after snapshot
-            synchronized (raftLog) {
-                int toRemove = snapshot.getLastIncludedIndex();
-                for (int i = 0; i < toRemove && !raftLog.isEmpty(); i++) {
-                    raftLog.remove(0);
-                }
-            }
-        }
-        
-        // Install snapshot
-        lastSnapshot = snapshot;
-        
-        // Restore state machine
-        stateMachine.clear();
-        stateMachine.addAll(snapshot.getStateMachineState());
-        
-        // Update indices
-        lastApplied.set(snapshot.getLastIncludedIndex());
-        commitIndex.set(Math.max(commitIndex.get(), snapshot.getLastIncludedIndex()));
-        
-        log.info("Snapshot installed successfully, state machine size: {}", stateMachine.size());
-        
-        logEvent(RaftEvent.EventType.SNAPSHOT_INSTALLED,
-            String.format("Installed snapshot at index %d", snapshot.getLastIncludedIndex()));
-    }
-    
-    // ==================== Advanced Raft Features ====================
-    
-    /**
-     * InstallSnapshot RPC - Leader sends snapshot to follower that's too far behind.
-     */
-    public InstallSnapshotResponse handleInstallSnapshot(InstallSnapshotRequest request) {
-        log.info("Received InstallSnapshot RPC from {} for term {}, lastIncludedIndex: {}", 
-                 request.getLeaderId(), request.getTerm(), request.getLastIncludedIndex());
-        
-        // Reply false if term < currentTerm
-        if (request.getTerm() < currentTerm.get()) {
-            log.debug("Rejecting snapshot from {} due to stale term {} < {}", 
-                     request.getLeaderId(), request.getTerm(), currentTerm.get());
-            return InstallSnapshotResponse.newBuilder()
-                .setTerm(currentTerm.get())
-                .setSuccess(false)
-                .build();
-        }
-        
-        // Update term if necessary
-        if (request.getTerm() > currentTerm.get()) {
-            currentTerm.set(request.getTerm());
-            state = NodeState.FOLLOWER;
-            votedFor = null;
-            
-            // Persist state change
-            persistenceService.saveState(config.getNodeId(), request.getTerm(), null);
-            
-            logEvent(RaftEvent.EventType.TERM_INCREASED, 
-                    "Term increased to " + request.getTerm() + " by InstallSnapshot from " + request.getLeaderId());
-        }
-        
-        // Reset election timer
-        lastHeartbeat = System.currentTimeMillis();
-        currentLeader = request.getLeaderId();
-        
-        // If snapshot is outdated, reject it
-        if (request.getLastIncludedIndex() <= commitIndex.get()) {
-            log.debug("Snapshot is outdated (lastIncludedIndex: {} <= commitIndex: {}), ignoring", 
-                     request.getLastIncludedIndex(), commitIndex.get());
-            return InstallSnapshotResponse.newBuilder()
-                .setTerm(currentTerm.get())
-                .setSuccess(true)  // Already have this data
-                .build();
-        }
-        
-        try {
-            // Deserialize snapshot data
-            java.io.ByteArrayInputStream bis = new java.io.ByteArrayInputStream(request.getData().toByteArray());
-            java.io.ObjectInputStream ois = new java.io.ObjectInputStream(bis);
-            
-            @SuppressWarnings("unchecked")
-            List<String> snapshotStateMachine = (List<String>) ois.readObject();
-            ois.readInt(); // snapshotTerm - not used in current implementation
-            
-            // Calculate size for monitoring
-            long sizeBytes = request.getData().size();
-            
-            // Create Snapshot object
-            Snapshot snapshot = new Snapshot(
-                request.getLastIncludedIndex(),
-                request.getLastIncludedTerm(),
-                new ArrayList<>(snapshotStateMachine),
-                null,  // ClusterConfiguration - not included in this implementation
-                System.currentTimeMillis(),
-                sizeBytes
-            );
-            
-            // Install snapshot
-            synchronized (stateMachine) {
-                stateMachine.clear();
-                stateMachine.addAll(snapshotStateMachine);
-            }
-            
-            synchronized (raftLog) {
-                // Discard entire log if snapshot is newer
-                if (request.getLastIncludedIndex() >= raftLog.size()) {
-                    int discarded = raftLog.size();
-                    raftLog.clear();
-                    log.info("Discarded entire log ({} entries) due to snapshot", discarded);
-                } else {
-                    // Discard log entries up to lastIncludedIndex
-                    int entriesToDiscard = Math.min(request.getLastIncludedIndex(), raftLog.size());
-                    if (entriesToDiscard > 0) {
-                        raftLog.subList(0, entriesToDiscard).clear();
-                        log.info("Discarded {} log entries due to snapshot", entriesToDiscard);
-                    }
-                }
-            }
-            
-            // Update snapshot and indices
-            lastSnapshot = snapshot;
-            commitIndex.set(Math.max(commitIndex.get(), request.getLastIncludedIndex()));
-            lastApplied.set(Math.max(lastApplied.get(), request.getLastIncludedIndex()));
-            compactedEntries.addAndGet(request.getLastIncludedIndex());
-            
-            // Persist snapshot and compacted log (CRITICAL for recovery)
-            persistenceService.saveSnapshot(config.getNodeId(), snapshot);
-            persistenceService.compactLog(config.getNodeId(), request.getLastIncludedIndex());
-            
-            logEvent(RaftEvent.EventType.SNAPSHOT_INSTALLED, 
-                    String.format("Installed snapshot from %s (index: %d, term: %d, size: %d entries)",
-                                request.getLeaderId(), request.getLastIncludedIndex(), 
-                                request.getLastIncludedTerm(), snapshotStateMachine.size()));
-            
-            log.info("Successfully installed snapshot from {} (lastIncludedIndex: {}, stateMachineSize: {})",
-                    request.getLeaderId(), request.getLastIncludedIndex(), snapshotStateMachine.size());
-            
-            return InstallSnapshotResponse.newBuilder()
-                .setTerm(currentTerm.get())
-                .setSuccess(true)
-                .build();
-                
-        } catch (Exception e) {
-            log.error("Failed to install snapshot from {}: {}", request.getLeaderId(), e.getMessage(), e);
-            return InstallSnapshotResponse.newBuilder()
-                .setTerm(currentTerm.get())
-                .setSuccess(false)
-                .build();
-        }
-    }
-    
-    /**
-     * Send InstallSnapshot RPC to a follower that's too far behind.
-     */
-    public boolean sendInstallSnapshot(String peerId) {
-        if (lastSnapshot == null) {
-            log.warn("Cannot send snapshot to {} - no snapshot available", peerId);
-            return false;
-        }
-        
-        try {
-            // Serialize snapshot data
-            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
-            java.io.ObjectOutputStream oos = new java.io.ObjectOutputStream(bos);
-            oos.writeObject(lastSnapshot.getStateMachineState());
-            oos.writeInt(lastSnapshot.getLastIncludedTerm());
-            oos.flush();
-            
-            InstallSnapshotRequest request = InstallSnapshotRequest.newBuilder()
-                .setTerm(currentTerm.get())
-                .setLeaderId(config.getNodeId())
-                .setLastIncludedIndex(lastSnapshot.getLastIncludedIndex())
-                .setLastIncludedTerm(lastSnapshot.getLastIncludedTerm())
-                .setData(com.google.protobuf.ByteString.copyFrom(bos.toByteArray()))
-                .setDone(true)
-                .setOffset(0)
-                .build();
-            
-            RaftServiceGrpc.RaftServiceBlockingStub stub = stubs.get(peerId);
-            if (stub == null) {
-                log.warn("No stub available for peer {}", peerId);
-                return false;
-            }
-            
-            InstallSnapshotResponse response = stub.withDeadlineAfter(5, TimeUnit.SECONDS)
-                .installSnapshot(request);
-            
-            if (response.getTerm() > currentTerm.get()) {
-                currentTerm.set(response.getTerm());
-                state = NodeState.FOLLOWER;
-                votedFor = null;
-                
-                // Persist state change
-                persistenceService.saveState(config.getNodeId(), response.getTerm(), null);
-                
-                logEvent(RaftEvent.EventType.TERM_INCREASED, 
-                        "Term increased to " + response.getTerm() + " by InstallSnapshot response from " + peerId);
-                return false;
-            }
-            
-            if (response.getSuccess()) {
-                // Update nextIndex and matchIndex for this follower
-                nextIndex.put(peerId, lastSnapshot.getLastIncludedIndex() + 1);
-                matchIndex.put(peerId, lastSnapshot.getLastIncludedIndex());
-                
-                log.info("Successfully sent snapshot to {} (lastIncludedIndex: {})", 
-                        peerId, lastSnapshot.getLastIncludedIndex());
-                return true;
-            } else {
-                log.warn("Follower {} rejected snapshot", peerId);
-                return false;
-            }
-            
-        } catch (Exception e) {
-            log.error("Failed to send snapshot to {}: {}", peerId, e.getMessage());
-            return false;
-        }
-    }
-    
-    /**
-     * Pre-vote RPC - Check if candidate would win election before disrupting cluster.
-     */
-    public VoteResponse handlePreVote(VoteRequest request) {
-        log.debug("Received PreVote RPC from {} for term {}", request.getCandidateId(), request.getTerm());
-        
-        // Grant pre-vote if:
-        // 1. Candidate's log is at least as up-to-date as receiver's log
-        // 2. Haven't heard from current leader recently (election timeout elapsed)
-        
-        boolean logUpToDate = isLogUpToDate(request.getLastLogIndex(), request.getLastLogTerm());
-        boolean electionTimeoutElapsed = (System.currentTimeMillis() - lastHeartbeat) > 
-            (ELECTION_TIMEOUT_MIN + ELECTION_TIMEOUT_MAX) / 2;
-        
-        boolean grantVote = logUpToDate && electionTimeoutElapsed;
-        
-        log.debug("PreVote for {}: logUpToDate={}, timeoutElapsed={}, granted={}", 
-                 request.getCandidateId(), logUpToDate, electionTimeoutElapsed, grantVote);
-        
-        return VoteResponse.newBuilder()
-            .setTerm(currentTerm.get())
-            .setVoteGranted(grantVote)
-            .build();
-    }
-    
-    /**
-     * Perform pre-vote phase before actual election.
-     * Returns true if pre-vote was successful (would win election).
-     */
-    public boolean performPreVote() {
-        log.info("Starting pre-vote phase for term {}", currentTerm.get() + 1);
-        
-        int votesReceived = 1; // Vote for self
-        int votesNeeded = (stubs.size() + 1) / 2 + 1;
-        
-        int lastLogIndex = raftLog.size();
-        int lastLogTerm = lastLogIndex > 0 ? 
-            raftLog.get(lastLogIndex - 1).getTerm() : 0;
-        
-        VoteRequest preVoteRequest = VoteRequest.newBuilder()
-            .setTerm(currentTerm.get() + 1)
-            .setCandidateId(config.getNodeId())
-            .setLastLogIndex(lastLogIndex)
-            .setLastLogTerm(lastLogTerm)
-            .build();
-        
-        for (String peerId : stubs.keySet()) {
-            try {
-                VoteResponse response = stubs.get(peerId)
-                    .withDeadlineAfter(500, TimeUnit.MILLISECONDS)
-                    .preVote(preVoteRequest);
-                
-                if (response.getVoteGranted()) {
-                    votesReceived++;
-                    log.debug("PreVote granted by {} ({}/{})", peerId, votesReceived, votesNeeded);
-                }
-                
-                if (votesReceived >= votesNeeded) {
-                    log.info("Pre-vote successful! Proceeding with actual election ({}/{})", 
-                            votesReceived, votesNeeded);
-                    return true;
-                }
-            } catch (Exception e) {
-                log.debug("Failed to get pre-vote from {}: {}", peerId, e.getMessage());
-            }
-        }
-        
-        log.info("Pre-vote failed ({}/{}), not starting election", votesReceived, votesNeeded);
-        return false;
-    }
-    
-    /**
-     * Linearizable read optimization - confirm leadership before responding to reads.
-     * 
-     * @return true if still leader and can safely respond to reads
-     */
-    public boolean confirmLeadership() {
-        if (state != NodeState.LEADER) {
-            return false;
-        }
-        
-        // Send heartbeats to majority of followers and wait for acknowledgment
-        int acks = 1; // Self
-        int needed = (stubs.size() + 1) / 2 + 1;
-        
-        for (String peerId : stubs.keySet()) {
-            try {
-                AppendEntriesRequest heartbeat = AppendEntriesRequest.newBuilder()
-                    .setTerm(currentTerm.get())
-                    .setLeaderId(config.getNodeId())
-                    .setPrevLogIndex(raftLog.size())
-                    .setPrevLogTerm(raftLog.isEmpty() ? 0 : 
-                        raftLog.get(raftLog.size() - 1).getTerm())
-                    .setLeaderCommit(commitIndex.get())
-                    .build();
-                
-                AppendEntriesResponse response = stubs.get(peerId)
-                    .withDeadlineAfter(500, TimeUnit.MILLISECONDS)
-                    .appendEntries(heartbeat);
-                
-                if (response.getTerm() == currentTerm.get() && response.getSuccess()) {
-                    acks++;
-                }
-                
-                if (response.getTerm() > currentTerm.get()) {
-                    // Step down if higher term discovered
-                    currentTerm.set(response.getTerm());
-                    state = NodeState.FOLLOWER;
-                    
-                    // Persist state change
-                    persistenceService.saveState(config.getNodeId(), response.getTerm(), null);
-                    
-                    return false;
-                }
-                
-                if (acks >= needed) {
-                    return true;
-                }
-            } catch (Exception e) {
-                log.debug("Failed to confirm leadership with {}: {}", peerId, e.getMessage());
-            }
-        }
-        
-        return acks >= needed;
-    }
-    
-    /**
-     * Simple leadership check without heartbeat confirmation.
-     * Less strict than confirmLeadership(), suitable for dashboard reads.
-     * 
-     * @return true if this node is currently the leader
-     */
-    public boolean isLeader() {
-        return state == NodeState.LEADER;
-    }
-    
-    /**
-     * Check if a log is at least as up-to-date as our log.
-     */
-    private boolean isLogUpToDate(int lastLogIndex, int lastLogTerm) {
-        int myLastIndex = raftLog.size();
-        int myLastTerm = myLastIndex > 0 ? raftLog.get(myLastIndex - 1).getTerm() : 0;
-        
-        if (lastLogTerm != myLastTerm) {
-            return lastLogTerm > myLastTerm;
-        }
-        return lastLogIndex >= myLastIndex;
-    }
-    
-    // Getters
-    
-    public NodeState getState() {
-        return state;
-    }
-    
-    public AtomicInteger getCurrentTerm() {
-        return currentTerm;
-    }
-    
-    public String getVotedFor() {
-        return votedFor;
-    }
-    
-    public String getCurrentLeader() {
-        return currentLeader;
-    }
-    
-    public AtomicInteger getCommitIndex() {
-        return commitIndex;
-    }
-    
-    public AtomicInteger getLastApplied() {
-        return lastApplied;
-    }
-    
-    public List<LogEntry> getRaftLog() {
-        return raftLog;
-    }
-    
-    public List<String> getStateMachine() {
-        return stateMachine;
-    }
-    
-    public RaftConfig getConfig() {
-        return config;
-    }
-    
-    public Map<String, RaftServiceGrpc.RaftServiceBlockingStub> getStubs() {
-        return stubs;
-    }
-    
-    public Map<String, Integer> getNextIndex() {
-        return nextIndex;
-    }
-    
-    public Map<String, Integer> getMatchIndex() {
-        return matchIndex;
-    }
-    
-    public boolean isSuspended() {
-        return suspended;
-    }
-    
-    public Snapshot getLastSnapshot() {
-        return lastSnapshot;
-    }
-    
-    public AtomicInteger getCompactedEntries() {
-        return compactedEntries;
-    }
-    
-    public AtomicInteger getTotalSnapshots() {
-        return totalSnapshots;
-    }
-    
-    // Setters for compatibility
-    
-    public void setState(NodeState newState) {
-        this.state = newState;
-    }
-    
-    public void setVotedFor(String nodeId) {
-        this.votedFor = nodeId;
-        // Persist state change
-        persistenceService.saveState(config.getNodeId(), currentTerm.get(), nodeId);
-    }
-    
-    public void setCurrentLeader(String leaderId) {
-        this.currentLeader = leaderId;
-    }
-    
-    public void setLastHeartbeat(long timestamp) {
-        this.lastHeartbeat = timestamp;
-    }
-    
-    public void setLastSnapshot(Snapshot snapshot) {
-        this.lastSnapshot = snapshot;
-    }
-    
-    public long getLastHeartbeat() {
-        return this.lastHeartbeat;
+
+    private record ReadBarrier(long sequence, Set<String> acks, CompletableFuture<Boolean> confirmed) {
     }
 }
-
-

@@ -37,6 +37,18 @@ class RaftGrpcServiceTest {
     }
 
     @Test
+    void suspendedNodeLooksUnavailableToItsPeers() {
+        when(raftNode.isSuspended()).thenReturn(true);
+
+        raftGrpcService.requestVote(VoteRequest.getDefaultInstance(), voteResponseObserver);
+
+        ArgumentCaptor<Throwable> error = ArgumentCaptor.forClass(Throwable.class);
+        verify(voteResponseObserver).onError(error.capture());
+        assertEquals(io.grpc.Status.Code.UNAVAILABLE, io.grpc.Status.fromThrowable(error.getValue()).getCode());
+        verify(raftNode, never()).handleVoteRequest(any());
+    }
+
+    @Test
     void testRequestVote() {
         VoteRequest request = VoteRequest.newBuilder()
             .setTerm(2)
