@@ -2,8 +2,6 @@ package com.example.raftimplementation.controller;
 
 import com.example.raftimplementation.dashboard.DashboardView;
 import com.example.raftimplementation.service.ClusterClient;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Controller;
@@ -14,6 +12,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.servlet.mvc.support.RedirectAttributes;
+import tools.jackson.databind.ObjectMapper;
 
 import java.util.List;
 import java.util.Map;
@@ -40,7 +39,7 @@ public class DashboardController {
                             @RequestParam(required = false) String tab,
                             @RequestHeader(name = "HX-Request", required = false) String htmxRequest,
                             @RequestHeader(name = "HX-History-Restore-Request", required = false) String historyRestore,
-                            Model model) throws JsonProcessingException {
+                            Model model) {
         DashboardView view = DashboardView.from(cluster.getOverview(), node, tab);
         model.addAttribute("view", view);
         model.addAttribute("graphJson", objectMapper.writeValueAsString(view.graph()));
