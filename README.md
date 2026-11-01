@@ -1,385 +1,187 @@
-# Raft Consensus Implementation with Spring Boot and gRPC
+# Raft Consensus with Spring Boot and gRPC
 
-![CI Tests](https://github.com/Swordpro3001/Raft-grpc/actions/workflows/test.yml/badge.svg)
-![Code Quality](https://github.com/Swordpro3001/Raft-grpc/actions/workflows/code-quality.yml/badge.svg)
-[![Java](https://img.shields.io/badge/Java-17-orange.svg)](https://www.oracle.com/java/)
+[![CI](https://github.com/Swordpro3001/Raft-grpc/actions/workflows/ci.yml/badge.svg)](https://github.com/Swordpro3001/Raft-grpc/actions/workflows/ci.yml)
+[![Code Quality](https://github.com/Swordpro3001/Raft-grpc/actions/workflows/quality.yml/badge.svg)](https://github.com/Swordpro3001/Raft-grpc/actions/workflows/quality.yml)
+[![Java](https://img.shields.io/badge/Java-21-orange.svg)](https://www.oracle.com/java/)
 [![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.5.6-brightgreen.svg)](https://spring.io/projects/spring-boot)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Production-ready Raft Consensus implementation with dynamic membership changes, log compaction, and advanced optimizations.
-
-## Features
-
-- Full Raft implementation (Leader Election, Log Replication, Commit)
-- gRPC communication between nodes
-- Dynamic cluster membership (add/remove servers safely)
-- Log compaction and automatic snapshotting
-- Advanced optimizations: InstallSnapshot, Pre-vote, Linearizable Reads
-- Comprehensive monitoring and metrics
-- Web dashboard visualization
-- REST API for cluster management
+An implementation of the [Raft consensus algorithm](https://raft.github.io/raft.pdf) with a web dashboard, built for learning and experimenting on one machine.
 
 ## Quick Start
 
-### Requirements
-- Java 21+
-- Gradle (or use the included Gradle Wrapper)
+You need Java 21 or newer. Nothing else: the Gradle wrapper is included.
 
-
-### Start Cluster
-**Windows:**
 ```bash
-start-cluster.bat
+raft.cmd          # Windows
+./raft.sh         # macOS, Linux
 ```
 
-**Manual:**
+This builds the project if needed and starts the dashboard and five nodes:
+
+```
+Dashboard   http://localhost:8080
+Starting    node1, node2, node3, node4, node5 (logs in logs\)
+Ready       leader node2 elected after 10.5 s. Press Ctrl+C to stop.
+```
+
+Press Ctrl+C or close the terminal to stop everything. The nodes never outlive the dashboard process.
+
+| Command | What it does |
+|---|---|
+| `raft start [nodes]` | Start a cluster, 5 nodes by default. This is the default command. |
+| `raft reset` | Delete all node data and logs |
+| `raft test` | Run the tests |
+
+Node data stays in `data/` between runs, and each node writes its log to `logs/nodeN.log`. To change the cluster size of existing data, run `raft reset` first.
+
+### Running nodes yourself
+
+To run a node on its own, for example in the debugger, use its profile. In this case nothing supervises the process.
+
 ```bash
 gradlew bootRun --args="--spring.profiles.active=node1"
-gradlew bootRun --args="--spring.profiles.active=node2"
-gradlew bootRun --args="--spring.profiles.active=node3"
 ```
 
-Open: [http://localhost:8080/index.html](http://localhost:8080/index.html)
+Running the application without a profile, for example from your IDE, starts the dashboard and the cluster, as `raft` does.
 
-## Core API
-
-### Submit Commands
-```bash
-# Auto-routes to leader
-curl -X POST http://localhost:8080/api/cluster/command \
-  -H "Content-Type: application/json" \
-  -d '{"command": "SET key=value"}'
-```
-
-### Cluster Management
-```bash
-# Add node
-curl -X POST http://localhost:8081/api/cluster/add \
-  -H "Content-Type: application/json" \
-  -d '{"nodeId":"node4","host":"localhost","grpcPort":9094,"httpPort":8084}'
-
-# Remove node
-curl -X POST http://localhost:8081/api/cluster/remove/node3
-
-# List members
-curl http://localhost:8081/api/membership/members
-```
-
-### Monitoring
-```bash
-# Performance metrics
-curl http://localhost:8081/api/metrics/performance
-
-# Replication status
-curl http://localhost:8081/api/metrics/replication
-
-# Snapshot stats
-curl http://localhost:8081/api/metrics/snapshots
-
-# Events with filtering
-curl 'http://localhost:8081/api/metrics/events?type=ELECTION_START&limit=10'
-```
-
-## Advanced Features
-
-### 1. Dynamic Membership Changes
-
-Safely add/remove nodes with automatic staging and rollback:
-
-**Adding a Node:**
-- Starts as staging (non-voting member)
-- Replicates log without affecting quorum
-- Automatically promoted after catching up
-- Falls back to previous config if timeout
-
-**Quorum Validation:**
-- Minimum 3 voting nodes enforced
-- Prevents cluster from becoming non-fault-tolerant
-- Validates before every removal
-
-**Example:**
-```bash
-# Start new node
-curl -X POST http://localhost:8081/api/nodes/node4/start
-
-# Add to cluster (auto-staging)
-sleep 10
-curl -X POST http://localhost:8081/api/cluster/add \
-  -H "Content-Type: application/json" \
-  -d '{"nodeId":"node4","host":"localhost","grpcPort":9094,"httpPort":8084,"staging":true}'
-
-# Verify membership
-curl http://localhost:8081/api/membership/members
-```
-
-### 2. Log Compaction & Snapshots
-
-Automatic snapshot creation when log reaches 100 entries:
-
-**Benefits:**
-- Memory reduced by ~95%
-- Followers catch up in seconds (vs minutes)
-- Enables indefinite cluster operation
-
-**Monitor:**
-```bash
-curl http://localhost:8081/api/metrics/snapshots
-```
-
-Response shows compression ratio and compacted entries count.
-
-### 3. Advanced Optimizations
-
-**InstallSnapshot RPC:**
-- Leaders send snapshots to far-behind followers
-- Recovery from seconds to milliseconds for lagging nodes
-- Automatic and transparent
-
-**Pre-vote Algorithm:**
-- Prevents disruption from partitioned nodes
-- Reduces unnecessary leader elections by 90%
-- Improves cluster stability
-
-**Linearizable Reads:**
-- Fast read operations (2-3x faster than writes)
-- No log replication needed
-- Strong consistency guarantee
-
-```bash
-# Read from leader
-curl http://localhost:8081/api/read
-```
-
-## Architecture
-
-### Three-Node Example
+## How It Works
 
 ```
-Client
-  |
-  +---> NodeManagerController
-           |
-           +---> [node1 (Leader), node2 (Follower), node3 (Follower)]
-                    |
-                    +---> gRPC communication
-                    +---> Log replication
-                    +---> Heartbeats
+Browser ---> Dashboard process (8080) ---REST---> node1 ... nodeN (8081 ...)
+             supervises the node JVMs                 |
+                                                      +--- gRPC (9091 ...) between nodes
+                                                      +--- H2 database in data/nodeN
 ```
 
-### Node States
+Node `nodeN` listens on HTTP port `8080+N` and gRPC port `9090+N`. All ports bind to `127.0.0.1` because the APIs have no authentication.
 
-- FOLLOWER: Default state, receives heartbeats
-- CANDIDATE: Initiates elections
-- LEADER: Accepts commands, replicates logs
+### The dashboard
 
-### gRPC Services
+The dashboard is rendered on the server with Thymeleaf. Links and forms are plain HTML, and [htmx](https://htmx.org) with idiomorph updates the live part of the page in place, every 1.5 seconds and after each action. The libraries come from WebJars, so there is no Node build and no CDN.
 
-- RequestVote: Leader election
-- AppendEntries: Log replication and heartbeats
-- InstallSnapshot: Fast catch-up for lagging followers
+- **Topology** is a [Cytoscape.js](https://js.cytoscape.org) graph of all machines with their role, term and log position, and the replication links from the leader. Select a machine to inspect it. The server provides the graph data; `cluster-graph.js` only draws it.
+- **Logs** shows the log of every machine, aligned by position. Each cell is an entry and shows its term. The legend explains which entries are committed, not committed, no-ops, membership changes, in a snapshot, or different from the leader's. Hover over an entry for details.
+
+`css/app.css` is a utility-first stylesheet that uses Tailwind's class names and scale. It is hand-written, so a class that is new to the templates has to be added there too.
+
+### Implemented from the Raft paper
+
+| Feature | Notes |
+|---|---|
+| Leader election | Randomized timeouts, durable term and vote |
+| Pre-vote | A server first checks that it could win, so a returning server cannot depose a healthy leader |
+| Log replication | Asynchronous, one RPC in flight per peer, automatic batching, fast backtracking on conflicts |
+| Commit rule | Only entries of the current term commit by counting replicas; each new leader commits a no-op |
+| Persistence | Term, vote and log are durable before a node answers an RPC |
+| Snapshots | Automatic log compaction, and InstallSnapshot for followers that fell behind |
+| Membership changes | Joint consensus; the configuration is part of the log, and a leader can remove itself |
+| Client commands | The API answers after the command is committed and applied |
+| Linearizable reads | ReadIndex: the leader confirms it still has a quorum before it reads |
+
+### Known limitations
+
+- **Duplicate commands.** There are no client sessions. If a command times out and is sent again, it can be applied twice (paper, section 8).
+- **New servers join as voters right away,** without the non-voting catch-up phase from section 6. A new server therefore counts towards the quorum while it is still catching up.
+- **Snapshots go over the wire in one message** of at most 64 MB, not in chunks.
+- **The state machine is a list of commands.** It demonstrates ordering and does not interpret them, and snapshots grow with it.
+
+## API
+
+The dashboard process routes these to the right node:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/command` | Submit a command, for example `{"command": "SET key=value"}` |
+| `GET /api/read` | Linearizable read of the state machine |
+| `GET /api/cluster/overview` | Status, events and log of all nodes |
+| `POST /api/cluster/add-node` | Start a new node and add it to the cluster |
+| `POST /api/cluster/remove-node/{nodeId}` | Remove a node from the cluster |
+| `POST /api/nodes/{nodeId}/start`, `stop` | Start or stop a node process |
+| `POST /api/nodes/{nodeId}/suspend`, `resume` | Pause Raft on a node while its process keeps running |
+| `POST /api/snapshot/create` | Create a snapshot on the leader |
+
+Each node has its own API, on port `8080+N`:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/status`, `GET /api/events` | State and recent events of this node |
+| `GET /api/log?limit=100` | Latest log entries, with commit and snapshot positions |
+| `POST /api/command` | Submit a command (leader only) |
+| `POST /api/cluster/command` | Submit a command, forwarded to the leader if necessary |
+| `GET /api/read?strict=false` | Faster read that may be stale. By default reads are linearizable. |
+| `POST /api/membership/add`, `POST /api/membership/remove/{nodeId}` | Membership changes (leader only) |
+| `GET /api/membership/members` | The current configuration |
+| `POST /api/suspend`, `POST /api/resume` | Pause or resume Raft |
+| `POST /api/snapshot/create`, `GET /api/snapshot/info` | Snapshots |
+| `GET /api/metrics/performance`, `health`, `replication`, `snapshots`, `events` | Metrics |
+
+A command returns one of these results: `COMMITTED`, `NOT_LEADER`, `SUSPENDED`, `LEADERSHIP_LOST` or `TIMEOUT`. After the last two, the command may or may not take effect.
 
 ## Configuration
 
-Each node has `src/main/resources/application-nodeX.properties`:
+Set these as `--name=value` arguments or in `application.properties`:
 
-```properties
-raft.node-id=node1
-server.port=8081
-spring.grpc.server.port=9091
-
-# Peer config
-raft.peers[0].node-id=node1
-raft.peers[0].host=localhost
-raft.peers[0].grpc-port=9091
-```
-
-### Tuning (in RaftNode.java)
-
-```java
-ELECTION_TIMEOUT_MIN = 3000;      // 3 seconds
-ELECTION_TIMEOUT_MAX = 5000;      // 5 seconds
-HEARTBEAT_INTERVAL = 1000;        // 1 second
-SNAPSHOT_THRESHOLD = 100;         // entries
-STAGING_DURATION_MS = 10000;      // 10 seconds
-MEMBERSHIP_CHANGE_TIMEOUT_MS = 30000; // 30 seconds
-```
-
-## Testing Features
-
-### Test Leader Election
-```bash
-# Stop current leader
-curl -X POST http://localhost:8081/api/nodes/node1/stop
-
-# Watch new leader election
-curl http://localhost:8082/api/status
-```
-
-### Test Log Replication
-```bash
-# Submit commands
-for i in {1..10}; do
-  curl -X POST http://localhost:8081/api/cluster/command \
-    -H "Content-Type: application/json" \
-    -d "{\"command\":\"test-$i\"}"
-done
-
-# Verify on all nodes
-curl http://localhost:8081/api/status | jq '.logSize'
-curl http://localhost:8082/api/status | jq '.logSize'
-```
-
-### Test Snapshots
-```bash
-# Create 150 entries (triggers snapshot)
-for i in {1..150}; do
-  curl -X POST http://localhost:8081/api/cluster/command \
-    -H "Content-Type: application/json" \
-    -d "{\"command\":\"cmd-$i\"}"
-  sleep 0.05
-done
-
-# Check snapshot created
-curl http://localhost:8081/api/metrics/snapshots | jq '.totalSnapshots'
-```
-
-### Test Membership Changes
-```bash
-# Add node4
-curl -X POST http://localhost:8081/api/nodes/node4/start
-sleep 10
-
-curl -X POST http://localhost:8081/api/cluster/add \
-  -H "Content-Type: application/json" \
-  -d '{"nodeId":"node4","host":"localhost","grpcPort":9094,"httpPort":8084}'
-
-# Verify
-curl http://localhost:8081/api/metrics/health | jq '.clusterSize'
-```
+| Property | Default | Purpose |
+|---|---|---|
+| `raft.cluster-size` | 5 | Size of the initial cluster, unless `raft.peers` lists it explicitly |
+| `raft.election-timeout-min-ms` | 1500 | Lower bound of the randomized election timeout |
+| `raft.election-timeout-max-ms` | 3000 | Upper bound of the randomized election timeout |
+| `raft.heartbeat-interval-ms` | 500 | Heartbeat interval of the leader |
+| `raft.rpc-timeout-ms` | 1000 | Deadline for RPCs between nodes |
+| `raft.command-timeout-ms` | 5000 | How long a client waits for a commit |
+| `raft.snapshot-threshold` | 100 | Log size that triggers a snapshot |
+| `raft.local.autostart` | true | Whether the dashboard starts the nodes |
 
 ## Project Structure
 
 ```
-src/
-├── main/java/com/example/raftimplementation/
-│   ├── config/         # Configuration classes
-│   ├── controller/     # REST API endpoints
-│   ├── grpc/           # gRPC service implementation
-│   ├── model/          # Data models
-│   ├── service/        # Core Raft logic
-│   └── proto/          # gRPC protocol definitions
-├── resources/
-│   ├── application-node*.properties  # Node configs
-│   └── index.html                    # Web dashboard
-└── test/
+raft.cmd, raft.sh              Start, reset and test commands
+src/main/proto/raft.proto      gRPC protocol
+src/main/java/.../
+    service/RaftNode           The Raft algorithm
+    service/NodeManagerService Local cluster supervisor
+    service/ClusterClient      The dashboard process's access to the nodes
+    dashboard/DashboardView    Everything the dashboard shows, ready for the templates
+    grpc/                      gRPC server and protobuf conversion
+    controller/                REST APIs of the nodes and the dashboard
+    persistence/               Durable state, log and snapshots
+src/main/resources/templates/  Dashboard pages (Thymeleaf)
+src/main/resources/static/     Stylesheet and graph script
+src/test/java/.../
+    service/RaftClusterIntegrationTest   Real nodes over real gRPC
+    service/RaftSafetyRegressionTest     Protocol rules, one test per rule
 ```
 
-## Monitoring
+See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) if something does not work.
 
-### Health Endpoint
+## CI and Releases
+
+| Workflow | Runs on | What it does |
+|---|---|---|
+| `ci.yml` | Pull requests, pushes to main, on demand | Tests and a smoke test of the packaged jar. Pushes to main and releases also run them on Windows and macOS. |
+| `quality.yml` | Pull requests, pushes to main, weekly | CodeQL analysis, and the dependency graph for Dependabot alerts |
+| `release.yml` | Version tags | Publishes a GitHub release |
+
+`.github/scripts/smoke-test.sh` runs on your machine too: it starts the jar, and checks failover, snapshots and recovery after a crash. It uses the same ports as the cluster, so stop any running cluster first.
+
+### Publishing a release
+
+Tag a commit on main and push the tag:
+
 ```bash
-curl http://localhost:8081/api/metrics/health
+git tag -a v1.2.0 -m "Version 1.2.0"
+git push origin v1.2.0
 ```
 
-Shows: node state, term, log size, commit index, snapshot info, peer connections
-
-### Performance Endpoint
-```bash
-curl http://localhost:8081/api/metrics/performance
-```
-
-Shows: throughput (cmd/s), election time (ms), replication latency (ms), leader stability (%)
-
-### Replication Endpoint
-```bash
-curl http://localhost:8081/api/metrics/replication
-```
-
-Shows per-peer: nextIndex, matchIndex, lag, upToDate status
-
-### Event History
-```bash
-# View events by type
-curl 'http://localhost:8081/api/metrics/events?type=ELECTION_WON&limit=10'
-```
-
-## Implementation Status
-
-**Core Raft:**
-- Leader election with timeouts
-- Log replication and commit
-- Persistent state management
-
-**Safety (Membership Changes):**
-- Quorum validation
-- Staging phase for new nodes
-- Automatic promotion
-- Rollback on failure
-- Joint consensus
-
-**Optimizations:**
-- InstallSnapshot RPC (fast recovery)
-- Pre-vote algorithm (election stability)
-- Linearizable reads (fast reads)
-- Async non-blocking gRPC
-
-**Log Compaction:**
-- Automatic snapshots at 100 entries
-- State machine preservation
-- Snapshot installation
-- Compression metrics
-
-**Monitoring:**
-- Performance metrics
-- Health metrics
-- Replication tracking
-- Event history with filtering
-- Snapshot statistics
-
-**API & Dashboard:**
-- Cluster command submission
-- Node management
-- Cluster membership control
-- Web visualization
-
-## Troubleshooting
-
-### Nodes not connecting
-- Verify ports 8081-8083, 9091-9093 are available
-- Check firewall settings
-- Review logs for connection errors
-
-### No leader elected
-- Wait 5-10 seconds initially
-- Ensure 2+ nodes running
-- Check network connectivity
-- Review election events: `curl 'http://localhost:8081/api/metrics/events?type=ELECTION_START'`
-
-### Commands not replicated
-- Verify you're contacting the leader
-- Use `/api/cluster/command` to auto-route
-- Check `commitIndex` and `lastApplied` match
-
-### High replication lag
-- Monitor: `curl http://localhost:8081/api/metrics/replication`
-- Check peer connectivity
-- Verify network bandwidth
-
-### Incorrect state machine indices
-- Happens after snapshots
-- Frontend auto-corrects using `snapshotBaseIndex`
-- Check: `curl http://localhost:8081/api/metrics/health` for snapshot info
+This runs all checks on all platforms, then publishes `raft-1.2.0.jar` with its SHA-256 checksum and generated release notes. A suffix like `v1.2.0-rc.1` makes it a prerelease. Tags on commits outside main, and tags of existing releases, are rejected.
 
 ## References
 
-- [Raft Paper](https://raft.github.io/raft.pdf)
-- [Raft Website](https://raft.github.io/)
-- [Raft Visualization](http://thesecretlivesofdata.com/raft/)
+- [Raft paper](https://raft.github.io/raft.pdf)
+- [Raft website](https://raft.github.io/)
+- [Raft visualization](http://thesecretlivesofdata.com/raft/)
 
 ## License
 
 MIT License
-
-## Author
-
-Built with Spring Boot 3.5.6, gRPC, and the Raft Consensus Algorithm

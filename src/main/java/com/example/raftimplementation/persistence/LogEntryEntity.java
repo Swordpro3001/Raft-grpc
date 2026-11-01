@@ -17,35 +17,42 @@ import lombok.NoArgsConstructor;
 @NoArgsConstructor
 @AllArgsConstructor
 public class LogEntryEntity {
-    
+
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
-    
+
     /**
      * Node ID that owns this log entry.
      */
     @Column(nullable = false)
     private String nodeId;
-    
+
     /**
      * Logical index of this entry in the log. -1 represents "no entries", valid entries start at index 0.
      */
     @Column(nullable = false)
     private int logIndex;
-    
+
     /**
      * Term when entry was created.
      */
     @Column(nullable = false)
     private int term;
-    
+
     /**
-     * Command to be applied to state machine.
+     * Command to be applied to state machine. Null for no-op and configuration entries.
      */
     @Column(nullable = true, length = 1000)
     private String command;
-    
+
+    /**
+     * Serialized ConfigurationEntry. Null unless this is a membership change.
+     */
+    @Lob
+    @Column(nullable = true)
+    private byte[] configuration;
+
     /**
      * Timestamp when entry was created.
      */

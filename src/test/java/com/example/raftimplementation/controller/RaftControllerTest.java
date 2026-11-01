@@ -1,5 +1,6 @@
 package com.example.raftimplementation.controller;
 
+import com.example.raftimplementation.model.CommandResult;
 import com.example.raftimplementation.model.RaftEvent;
 import com.example.raftimplementation.service.RaftNode;
 import org.junit.jupiter.api.BeforeEach;
@@ -73,7 +74,7 @@ class RaftControllerTest {
         Map<String, String> request = new HashMap<>();
         request.put("command", "SET x=1");
 
-        when(raftNode.submitCommand("SET x=1")).thenReturn(true);
+        when(raftNode.submitCommand("SET x=1")).thenReturn(CommandResult.COMMITTED);
 
         ResponseEntity<Map<String, Object>> response = raftController.submitCommand(request);
 
@@ -89,7 +90,7 @@ class RaftControllerTest {
         Map<String, String> request = new HashMap<>();
         request.put("command", "SET x=1");
 
-        when(raftNode.submitCommand("SET x=1")).thenReturn(false);
+        when(raftNode.submitCommand("SET x=1")).thenReturn(CommandResult.NOT_LEADER);
         when(raftNode.getCurrentLeader()).thenReturn("node2");
 
         ResponseEntity<Map<String, Object>> response = raftController.submitCommand(request);
@@ -128,6 +129,16 @@ class RaftControllerTest {
         assertNotNull(response.getBody());
         assertFalse((Boolean) response.getBody().get("success"));
         
+        verify(raftNode, never()).submitCommand(anyString());
+    }
+
+    @Test
+    void testSubmitCommand_TooLong() {
+        Map<String, String> request = Map.of("command", "x".repeat(1001));
+
+        ResponseEntity<Map<String, Object>> response = raftController.submitCommand(request);
+
+        assertEquals(HttpStatus.BAD_REQUEST, response.getStatusCode());
         verify(raftNode, never()).submitCommand(anyString());
     }
 
@@ -189,7 +200,7 @@ class RaftControllerTest {
         Map<String, String> request2 = new HashMap<>();
         request2.put("command", "SET y=2");
 
-        when(raftNode.submitCommand(anyString())).thenReturn(true);
+        when(raftNode.submitCommand(anyString())).thenReturn(CommandResult.COMMITTED);
 
         ResponseEntity<Map<String, Object>> response1 = raftController.submitCommand(request1);
         ResponseEntity<Map<String, Object>> response2 = raftController.submitCommand(request2);

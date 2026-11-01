@@ -1,111 +1,120 @@
 name: Release
 
+# Publishes a GitHub release when a version tag is pushed:
+#   git tag -a v1.2.0 -m "Version 1.2.0"
+#   git push origin v1.2.0
+# A suffix, as in v1.2.0-rc.1, makes it a prerelease.
 on:
   push:
     tags:
-      - 'v*.*.*'  # Triggers on version tags like v1.0.0
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Release version'
-        required: true
-        default: 'v1.0.0'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+
+permissions:
+  contents: read
+
+# Releases run one after the other, in the order of their tags
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
-  build-and-release:
-    name: Build and Create Release
+  check-tag:
+    name: Check tag
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Read version from tag
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag $TAG is not a version like v1.2.0 or v1.2.0-rc.1"
+            exit 1
+          fi
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: Only release what is on main
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag $TAG points to a commit that is not on main"
+            exit 1
+          fi
+      - name: Do not replace an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "::error::Release $TAG already exists. Delete it first to publish it again."
+            exit 1
+          fi
+
+  verify:
+    name: Verify
+    needs: check-tag
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish
+    needs: [check-tag, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
-      packages: write
-    
+    env:
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.check-tag.outputs.version }}
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-        
-    - name: Set up JDK 21
-      uses: actions/setup-java@v4
-      with:
-        java-version: '21'
-        distribution: 'temurin'
-        cache: 'gradle'
-        
-    - name: Grant execute permission for gradlew
-      run: chmod +x gradlew
-      
-    - name: Extract version from tag
-      id: version
-      run: |
-        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-          echo "VERSION=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-        else
-          echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-        fi
-        
-    - name: Build project
-      run: ./gradlew build -x test --no-daemon
-      
-    - name: Run tests
-      run: ./gradlew test --no-daemon
-      
-    - name: Build JAR
-      run: ./gradlew bootJar --no-daemon
-      
-    - name: Get JAR name
-      id: jar
-      run: |
-        JAR_FILE=$(ls build/libs/*.jar | head -n 1)
-        echo "JAR_PATH=$JAR_FILE" >> $GITHUB_OUTPUT
-        echo "JAR_NAME=$(basename $JAR_FILE)" >> $GITHUB_OUTPUT
-        
-    - name: Create Release
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: ${{ steps.version.outputs.VERSION }}
-        name: Release ${{ steps.version.outputs.VERSION }}
-        body: |
-          ## Raft Implementation Release ${{ steps.version.outputs.VERSION }}
-          
-          ### Features
-          - Raft consensus algorithm implementation
-          - gRPC communication between nodes
-          - Web dashboard for cluster management
-          - REST API for commands and status
-          - Node management (start/stop)
-          - Event logging and monitoring
-          
-          ### Artifacts
-          - `${{ steps.jar.outputs.JAR_NAME }}` - Executable JAR file
-          
-          ### How to Run
-          ```bash
-          # Start Node 1
-          java -jar ${{ steps.jar.outputs.JAR_NAME }} --spring.profiles.active=node1
-          
-          # Start Node 2 (in another terminal)
-          java -jar ${{ steps.jar.outputs.JAR_NAME }} --spring.profiles.active=node2
-          
-          # Start Node 3 (in another terminal)
-          java -jar ${{ steps.jar.outputs.JAR_NAME }} --spring.profiles.active=node3
-          
-          # Open Dashboard
-          Open http://localhost:8081 in your browser
-          ```
-          
-          ### Documentation
-          - README.md - Main documentation
-          - SCHNELLSTART.md - Quick start guide
-          - TROUBLESHOOTING.md - Problem solving
-          
-        files: |
-          ${{ steps.jar.outputs.JAR_PATH }}
-          README.md
-          SCHNELLSTART.md
-          TROUBLESHOOTING.md
-          FIXES-ZUSAMMENFASSUNG.md
-        draft: false
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      - name: Build the jar with its version
+        run: |
+          ./gradlew bootJar -PreleaseVersion="$VERSION"
+          unzip -p build/libs/raft.jar META-INF/MANIFEST.MF | grep -q "^Implementation-Version: $VERSION"
+      - name: Smoke test the jar that gets published
+        run: bash .github/scripts/smoke-test.sh
+      - name: Package
+        run: |
+          mkdir dist
+          cp build/libs/raft.jar "dist/raft-$VERSION.jar"
+          cd dist
+          sha256sum "raft-$VERSION.jar" > "raft-$VERSION.jar.sha256"
+      - name: Write release notes
+        run: |
+          cat > notes.md <<EOF
+          Requires Java 21 or newer. This starts the dashboard and a local five-node cluster:
+
+          \`\`\`bash
+          java -jar raft-$VERSION.jar
+          \`\`\`
+
+          Then open http://localhost:8080.
+
+          EOF
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          if [[ "$VERSION" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$TAG" dist/* \
+            --verify-tag \
+            --title "$TAG" \
+            --notes-file notes.md \
+            --generate-notes \
+            "${flags[@]}"

@@ -1,0 +1,348 @@
+/*
+ * Utility-first stylesheet using Tailwind's class names and scale, without a Node build step.
+ * Layout and typography are composed from utilities in the templates. Only things a
+ * utility cannot express get a component class at the end of this file.
+ */
+
+/* ========== Theme (what would be tailwind.config) ========== */
+
+:root {
+    color-scheme: light;
+    --color-canvas: #f5f5f7;
+    --color-surface: #ffffff;
+    --color-node: #f5f5f7;
+    --color-ink: #1d1d1f;
+    --color-muted: #6e6e73;
+    --color-line: rgba(0, 0, 0, .08);
+    --color-line-solid: #d2d2d7;
+    --color-fill: rgba(120, 120, 128, .12);
+    --color-fill-soft: rgba(120, 120, 128, .07);
+    --color-accent: #0071e3;
+    --color-accent-tint: rgba(0, 113, 227, .08);
+    --color-on-accent: #ffffff;
+    --color-good: #248a3d;
+    --color-warn: #b25000;
+    --color-bad: #d70015;
+    --color-bar: rgba(245, 245, 247, .72);
+    --color-float: rgba(255, 255, 255, .78);
+    --color-segment: #ffffff;
+    --color-log: #d2d2d7;
+    --color-log-ink: #1d1d1f;
+    --shadow-card: 0 0 0 1px rgba(0, 0, 0, .04), 0 1px 2px rgba(0, 0, 0, .03), 0 8px 24px rgba(0, 0, 0, .03);
+    --shadow-float: 0 0 0 1px rgba(0, 0, 0, .07), 0 12px 40px rgba(0, 0, 0, .14);
+    --shadow-segment: 0 1px 3px rgba(0, 0, 0, .14);
+    --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
+}
+
+/*
+ * The dark theme, twice, because a media query and a selector cannot share one rule. Keep both the same.
+ * The first applies the theme chosen with the switch, the second the system's while no theme is set.
+ */
+:root[data-theme="dark"] {
+    color-scheme: dark;
+    --color-canvas: #000000;
+    --color-surface: #1c1c1e;
+    --color-node: #2c2c2e;
+    --color-ink: #f5f5f7;
+    --color-muted: #a1a1a6;
+    --color-line: rgba(255, 255, 255, .1);
+    --color-line-solid: #48484a;
+    --color-fill: rgba(120, 120, 128, .28);
+    --color-fill-soft: rgba(120, 120, 128, .14);
+    --color-accent: #2997ff;
+    --color-accent-tint: rgba(41, 151, 255, .14);
+    --color-on-accent: #000000;
+    --color-good: #30d158;
+    --color-warn: #ff9f0a;
+    --color-bad: #ff453a;
+    --color-bar: rgba(22, 22, 23, .72);
+    --color-float: rgba(44, 44, 46, .72);
+    --color-segment: #636366;
+    --color-log: #48484a;
+    --color-log-ink: #f5f5f7;
+    --shadow-card: 0 0 0 1px rgba(255, 255, 255, .06);
+    --shadow-float: 0 0 0 1px rgba(255, 255, 255, .12), 0 12px 40px rgba(0, 0, 0, .6);
+    --shadow-segment: none;
+}
+@media (prefers-color-scheme: dark) {
+    :root:not([data-theme]) {
+        color-scheme: dark;
+        --color-canvas: #000000;
+        --color-surface: #1c1c1e;
+        --color-node: #2c2c2e;
+        --color-ink: #f5f5f7;
+        --color-muted: #a1a1a6;
+        --color-line: rgba(255, 255, 255, .1);
+        --color-line-solid: #48484a;
+        --color-fill: rgba(120, 120, 128, .28);
+        --color-fill-soft: rgba(120, 120, 128, .14);
+        --color-accent: #2997ff;
+        --color-accent-tint: rgba(41, 151, 255, .14);
+        --color-on-accent: #000000;
+        --color-good: #30d158;
+        --color-warn: #ff9f0a;
+        --color-bad: #ff453a;
+        --color-bar: rgba(22, 22, 23, .72);
+        --color-float: rgba(44, 44, 46, .72);
+        --color-segment: #636366;
+        --color-log: #48484a;
+        --color-log-ink: #f5f5f7;
+        --shadow-card: 0 0 0 1px rgba(255, 255, 255, .06);
+        --shadow-float: 0 0 0 1px rgba(255, 255, 255, .12), 0 12px 40px rgba(0, 0, 0, .6);
+        --shadow-segment: none;
+    }
+}
+
+/* ========== Base (what would be preflight) ========== */
+
+*, ::before, ::after { box-sizing: border-box; margin: 0; padding: 0; border: 0 solid var(--color-line); }
+html { font-family: var(--font-sans); line-height: 1.43; letter-spacing: -.008em; }
+a { color: inherit; text-decoration: none; }
+ol, ul { list-style: none; }
+table { border-collapse: collapse; }
+button, input { font: inherit; letter-spacing: inherit; color: inherit; background: none; }
+:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+
+/* ========== Utilities ========== */
+
+/* Layout */
+.flex { display: flex; }
+.inline-flex { display: inline-flex; }
+.grid { display: grid; }
+.contents { display: contents; }
+.hidden { display: none; }
+.flex-1 { flex: 1 1 0%; min-width: 0; }
+.flex-none { flex: none; }
+.flex-col { flex-direction: column; }
+.flex-wrap { flex-wrap: wrap; }
+.items-center { align-items: center; }
+.justify-between { justify-content: space-between; }
+.grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.gap-2 { gap: .5rem; }
+.gap-3 { gap: .75rem; }
+.gap-4 { gap: 1rem; }
+.gap-x-4 { column-gap: 1rem; }
+.gap-y-1 { row-gap: .25rem; }
+
+/* Position */
+.relative { position: relative; }
+.sticky { position: sticky; }
+.top-0 { top: 0; }
+.z-10 { z-index: 10; }
+.overflow-hidden { overflow: hidden; }
+.overflow-x-auto { overflow-x: auto; }
+.overflow-y-auto { overflow-y: auto; }
+
+/* Sizing */
+.w-8 { width: 2rem; }
+.w-full { width: 100%; }
+.h-12 { height: 3rem; }
+.h-64 { height: 16rem; }
+.max-h-60 { max-height: 15rem; }
+.max-w-7xl { max-width: 80rem; }
+
+/* Spacing */
+.mx-auto { margin-inline: auto; }
+.mx-5 { margin-inline: 1.25rem; }
+.mt-1 { margin-top: .25rem; }
+.mt-2 { margin-top: .5rem; }
+.mt-3 { margin-top: .75rem; }
+.mt-8 { margin-top: 2rem; }
+.mb-2 { margin-bottom: .5rem; }
+.mb-3 { margin-bottom: .75rem; }
+.ml-1 { margin-left: .25rem; }
+.p-px { padding: 1px; }
+.px-5 { padding-inline: 1.25rem; }
+.px-6 { padding-inline: 1.5rem; }
+.py-1 { padding-block: .25rem; }
+.py-2 { padding-block: .5rem; }
+.py-3 { padding-block: .75rem; }
+.py-4 { padding-block: 1rem; }
+.py-6 { padding-block: 1.5rem; }
+.pt-4 { padding-top: 1rem; }
+.pt-5 { padding-top: 1.25rem; }
+.pt-10 { padding-top: 2.5rem; }
+.pb-2 { padding-bottom: .5rem; }
+.pb-4 { padding-bottom: 1rem; }
+.pb-6 { padding-bottom: 1.5rem; }
+.pb-32 { padding-bottom: 8rem; }
+.pl-5 { padding-left: 1.25rem; }
+.pr-2 { padding-right: .5rem; }
+.pr-3 { padding-right: .75rem; }
+.pr-5 { padding-right: 1.25rem; }
+
+/* Typography */
+.font-mono { font-family: var(--font-mono); font-size: .78rem; letter-spacing: 0; }
+.text-xs { font-size: .75rem; line-height: 1rem; }
+.text-sm { font-size: .875rem; line-height: 1.25rem; }
+.text-base { font-size: .9375rem; line-height: 1.4rem; }
+.text-lg { font-size: 1.0625rem; line-height: 1.5rem; }
+.text-2xl { font-size: 1.5rem; line-height: 1.2; }
+.text-3xl { font-size: 1.875rem; line-height: 1.15; }
+.text-4xl { font-size: 2.5rem; line-height: 1.08; }
+.font-normal { font-weight: 400; }
+.font-medium { font-weight: 500; }
+.font-semibold { font-weight: 600; }
+.tracking-tight { letter-spacing: -.022em; }
+.tracking-normal { letter-spacing: -.008em; }
+.tabular-nums { font-variant-numeric: tabular-nums; }
+.antialiased { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+.text-left { text-align: left; }
+.text-center { text-align: center; }
+.text-right { text-align: right; }
+.whitespace-nowrap { white-space: nowrap; }
+.break-anywhere { overflow-wrap: anywhere; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+
+/* Color */
+.bg-canvas { background-color: var(--color-canvas); }
+.bg-surface { background-color: var(--color-surface); }
+.bg-bar { background-color: var(--color-bar); }
+.bg-fill { background-color: var(--color-fill); }
+.bg-accent-tint { background-color: var(--color-accent-tint); }
+.bg-good { background-color: var(--color-good); }
+.bg-warn { background-color: var(--color-warn); }
+.bg-bad { background-color: var(--color-bad); }
+.bg-ink { background-color: var(--color-ink); }
+.text-ink { color: var(--color-ink); }
+.text-muted { color: var(--color-muted); }
+.text-bad { color: var(--color-bad); }
+.text-canvas { color: var(--color-canvas); }
+.text-on-accent { color: var(--color-on-accent); }
+
+/* Borders and effects */
+.border-t { border-top-width: 1px; }
+.border-b { border-bottom-width: 1px; }
+.border-2 { border-width: 2px; }
+.border-line { border-color: var(--color-line); }
+.border-muted { border-color: var(--color-muted); }
+.last\:border-b-0:last-child { border-bottom-width: 0; }
+.divide-y > * + * { border-top-width: 1px; }
+.rounded-lg { border-radius: .5625rem; }
+.rounded-2xl { border-radius: 1.125rem; }
+.shadow-card { box-shadow: var(--shadow-card); }
+.backdrop-blur { -webkit-backdrop-filter: saturate(180%) blur(20px); backdrop-filter: saturate(180%) blur(20px); }
+
+/* Responsive */
+@media (min-width: 640px) {
+    .sm\:table-cell { display: table-cell; }
+}
+@media (min-width: 768px) {
+    .md\:grid-cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .md\:h-96 { height: 24rem; }
+}
+
+/* ========== Components ========== */
+
+/*
+ * The page layout. Sections name the area they belong to, so that the live #state element can
+ * stay out of the grid (display: contents) while the topology outside of it keeps its canvas.
+ */
+.dashboard-grid {
+    display: grid; gap: 1rem; grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "metrics" "topology" "nodes" "inspector" "logs" "replication" "snapshots";
+}
+.area-metrics { grid-area: metrics; }
+.area-topology { grid-area: topology; }
+.area-nodes { grid-area: nodes; }
+.area-inspector { grid-area: inspector; }
+.area-logs { grid-area: logs; }
+.area-replication { grid-area: replication; }
+.area-snapshots { grid-area: snapshots; }
+
+@media (min-width: 1024px) {
+    .dashboard-grid {
+        grid-template-columns: minmax(0, 1fr) 22rem;
+        grid-template-rows: auto auto 1fr;
+        grid-template-areas:
+            "metrics     inspector"
+            "topology    inspector"
+            "nodes       inspector"
+            "logs        logs"
+            "replication snapshots";
+    }
+}
+
+.dot { width: .5rem; height: .5rem; border-radius: 50%; flex: none; display: inline-block; }
+
+.btn {
+    padding: .3rem .85rem; border-radius: 980px; white-space: nowrap; cursor: pointer;
+    background-color: var(--color-fill); transition: background-color .15s, opacity .15s;
+}
+.btn:hover:not(:disabled) { background-color: var(--color-fill-soft); }
+.btn-primary { background-color: var(--color-accent); color: var(--color-on-accent); font-weight: 500; }
+.btn-primary:hover:not(:disabled) { background-color: var(--color-accent); opacity: .88; }
+.btn-link { color: var(--color-accent); cursor: pointer; padding: .125rem; }
+.btn-link:hover:not(:disabled) { text-decoration: underline; }
+.btn:disabled, .btn-link:disabled { opacity: .4; cursor: default; }
+
+/* Hover and selection use the same tint family, so a selected row stays selected under the pointer */
+.row { transition: background-color .15s; }
+.row:hover { background-color: var(--color-fill-soft); }
+.row.bg-accent-tint:hover { background-color: var(--color-accent-tint); }
+
+.input { padding-block: .25rem; outline: 0; }
+.input::placeholder { color: var(--color-muted); }
+
+/* Floats over the page and is always within reach. It shows the result of a read above its input. */
+.command-bar {
+    position: fixed; left: 50%; bottom: 1.25rem; transform: translateX(-50%); z-index: 10;
+    width: min(42rem, calc(100vw - 2rem)); overflow: hidden; border-radius: 1.5rem;
+    background-color: var(--color-float); box-shadow: var(--shadow-float);
+    -webkit-backdrop-filter: saturate(180%) blur(24px); backdrop-filter: saturate(180%) blur(24px);
+    transition: box-shadow .15s;
+}
+.command-bar:focus-within { box-shadow: 0 0 0 2px var(--color-accent), var(--shadow-float); }
+
+.segment { flex: 1; padding: .2rem .6rem; border-radius: .5rem; text-align: center; font-size: .8125rem; }
+.segment-active,
+[data-theme="light"] [data-theme-choice="light"],
+[data-theme="dark"] [data-theme-choice="dark"] { background-color: var(--color-segment); box-shadow: var(--shadow-segment); font-weight: 500; }
+
+/* Only works with JavaScript, which is what sets data-theme */
+.theme-switch { display: none; }
+[data-theme] .theme-switch { display: flex; }
+.theme-switch .segment { min-width: 3.25rem; padding-block: .1rem; cursor: pointer; }
+
+/* Takes up what is left of the inspector. The zero basis keeps long lists from stretching the page. */
+.feed { flex: 1 1 0; min-height: 18rem; overflow-y: auto; }
+
+/* Makes a whole table row act as the link it contains */
+.stretched-link::after { content: ""; position: absolute; inset: 0; }
+
+.notice {
+    position: fixed; left: 50%; top: 3.75rem; transform: translateX(-50%); z-index: 20;
+    max-width: min(32rem, calc(100vw - 2rem)); padding: .55rem 1.1rem; border-radius: 1.25rem; font-size: .8125rem;
+    box-shadow: var(--shadow-float); pointer-events: none; animation: notice-fade 4s forwards;
+}
+@keyframes notice-fade { 0%, 80% { opacity: 1; } 100% { opacity: 0; visibility: hidden; } }
+
+.disconnected-banner { display: none; }
+body.disconnected .disconnected-banner { display: block; }
+
+/* The log matrix: each cell is one entry, with 2px between marks. Text always stays in ink colors. */
+.log-table { border-collapse: separate; border-spacing: 2px; }
+.log-index { min-width: 1.75rem; font-size: .6875rem; font-weight: 400; color: var(--color-muted); text-align: center; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.log-cell {
+    display: flex; align-items: center; justify-content: center;
+    width: 1.75rem; height: 1.75rem; border-radius: .375rem;
+    font-size: .6875rem; font-variant-numeric: tabular-nums; cursor: default;
+}
+.log-swatch { width: .875rem; height: .875rem; border-radius: .25rem; display: inline-block; }
+.log-empty { background-color: var(--color-fill-soft); }
+.log-committed { background-color: var(--color-log); color: var(--color-log-ink); }
+.log-uncommitted { box-shadow: inset 0 0 0 1.5px var(--color-accent); color: var(--color-ink); }
+.log-noop { opacity: .55; }
+.log-config { box-shadow: inset 0 -3px 0 0 var(--color-accent); }
+.log-uncommitted.log-config { box-shadow: inset 0 0 0 1.5px var(--color-accent), inset 0 -3px 0 0 var(--color-accent); }
+.log-compacted {
+    background-image: repeating-linear-gradient(135deg, var(--color-log) 0 2px, transparent 2px 5px);
+    background-color: var(--color-fill-soft);
+}
+.log-differs { outline: 2px solid var(--color-warn); outline-offset: -2px; opacity: 1; }
+
+@media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+    .notice { animation-duration: 6s; }
+}

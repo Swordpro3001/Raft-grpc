@@ -58,6 +58,10 @@ message AppendEntriesResponse {
   int32 term = 1;
   bool success = 2;
   int32 matchIndex = 3;
+  // Set when success is false: lets the leader skip a whole conflicting term
+  // instead of backing up one entry per round trip (Raft paper, section 5.3).
+  int32 conflictIndex = 4;
+  int32 conflictTerm = 5;
 }
 
 message InstallSnapshotRequest {
@@ -65,9 +69,14 @@ message InstallSnapshotRequest {
   string leaderId = 2;
   int32 lastIncludedIndex = 3;
   int32 lastIncludedTerm = 4;
-  bytes data = 5;  // Serialized snapshot data
+  bytes data = 5;  // Serialized SnapshotData
   bool done = 6;   // For chunked transfer (future optimization)
   int64 offset = 7; // For chunked transfer (future optimization)
+}
+
+message SnapshotData {
+  repeated string stateMachine = 1;
+  ConfigurationEntry configuration = 2;
 }
 
 message InstallSnapshotResponse {

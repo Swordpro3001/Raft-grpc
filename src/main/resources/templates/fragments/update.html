@@ -1,0 +1,10 @@
+<!-- What htmx receives after polling or an action: the live part of the page, plus the small parts outside of it. -->
+<th:block xmlns:th="http://www.thymeleaf.org">
+    <div th:replace="~{fragments/parts :: state}"></div>
+    <div th:replace="~{fragments/parts :: health(true)}"></div>
+    <p th:replace="~{fragments/parts :: summary(true)}"></p>
+    <div th:replace="~{fragments/parts :: graphData(true)}"></div>
+    <span th:replace="~{fragments/parts :: context(true)}"></span>
+    <th:block th:if="${notice != null}"><div th:replace="~{fragments/parts :: notice(true)}"></div></th:block>
+    <th:block th:if="${readResult != null}"><div th:replace="~{fragments/parts :: readResult(true)}"></div></th:block>
+</th:block>

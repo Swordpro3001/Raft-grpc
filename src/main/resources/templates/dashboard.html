@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta name="htmx-config" content='{"scrollIntoViewOnBoost":false,"historyCacheSize":0,"includeIndicatorStyles":false}'>
+    <title>Raft</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" th:href="@{/css/app.css}">
+    <script th:src="@{/js/theme.js}"></script>
+    <script defer th:src="@{/webjars/htmx.org/dist/htmx.min.js}"></script>
+    <script defer th:src="@{/webjars/idiomorph/dist/idiomorph-ext.min.js}"></script>
+    <script defer th:src="@{/webjars/cytoscape/dist/cytoscape.min.js}"></script>
+    <script defer th:src="@{/js/cluster-graph.js}"></script>
+</head>
+<!-- Every link and form below updates #state in place. Without JavaScript they work as a normal page. -->
+<body class="bg-canvas text-ink text-sm antialiased" hx-ext="morph" hx-boost="true" hx-target="#state" hx-swap="morph:outerHTML">
+    <header class="sticky top-0 z-10 bg-bar backdrop-blur border-b border-line">
+        <div class="max-w-7xl h-12 mx-auto px-6 flex items-center justify-between">
+            <a class="text-base font-semibold" th:href="@{/}">Raft</a>
+            <div class="flex items-center gap-4">
+                <div th:replace="~{fragments/parts :: health(false)}"></div>
+                <div class="theme-switch p-px bg-fill rounded-lg" role="group" aria-label="Theme">
+                    <button class="segment" type="button" data-theme-choice="light">Light</button>
+                    <button class="segment" type="button" data-theme-choice="dark">Dark</button>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <div class="disconnected-banner bg-bad text-on-accent text-center py-1">
+        The dashboard server is not reachable. Showing the last known state.
+    </div>
+
+    <main class="max-w-7xl mx-auto px-6 pt-10 pb-32">
+        <h1 class="text-4xl font-semibold tracking-tight">Cluster</h1>
+        <p th:replace="~{fragments/parts :: summary(false)}"></p>
+
+        <div class="dashboard-grid mt-8">
+            <section class="area-topology bg-surface rounded-2xl shadow-card overflow-hidden" aria-label="Cluster topology">
+                <div class="flex items-center justify-between gap-3 px-5 pt-4">
+                    <h2 class="text-base font-semibold">Topology</h2>
+                    <p class="text-xs text-muted">Select a machine to inspect it</p>
+                </div>
+                <div id="cluster-graph" class="h-64 md:h-96" role="img"
+                     aria-label="Graph of the machines in the cluster and their replication links. The Nodes table lists the same information."></div>
+                <noscript><p class="px-5 py-3 text-muted">The graph needs JavaScript. The tables show the same information.</p></noscript>
+                <div th:replace="~{fragments/parts :: graphData(false)}"></div>
+            </section>
+
+            <div th:replace="~{fragments/parts :: state}"></div>
+        </div>
+
+        <section class="command-bar" aria-label="Commands">
+            <div th:replace="~{fragments/parts :: readResult(false)}"></div>
+            <form class="flex items-center gap-2 py-2 pl-5 pr-2" method="post" th:action="@{/actions/command}"
+                  hx-on--after-request="if (event.detail.requestConfig.formData.get('action') !== 'read') this.reset()">
+                <span th:replace="~{fragments/parts :: context(false)}"></span>
+                <input class="input flex-1" type="text" name="command" maxlength="1000" autocomplete="off"
+                       placeholder="Enter a command, for example SET key=value" aria-label="Command">
+                <button class="btn" type="submit" name="action" value="read">Read</button>
+                <button class="btn btn-primary" type="submit" name="action" value="send">Send</button>
+            </form>
+        </section>
+    </main>
+
+    <div th:replace="~{fragments/parts :: notice(false)}"></div>
+</body>
+</html>
