@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org">
+<body>
+
+<div th:fragment="health(oob)" id="health" class="inline-flex items-center gap-2 text-muted" role="status"
+     th:attr="hx-swap-oob=${oob ? 'true' : null}">
+    <span class="dot" th:classappend="${view.health.dot}"></span>
+    <span th:text="${view.health.label}">Healthy</span>
+</div>
+
+<p th:fragment="summary(oob)" id="summary" class="mt-2 text-lg text-muted"
+   th:attr="hx-swap-oob=${oob ? 'true' : null}" th:text="${view.summary}">Leader node1</p>
+
+<!-- Read by cluster-graph.js. An attribute keeps the JSON safely escaped. -->
+<div th:fragment="graphData(oob)" id="graph-data" hidden
+     th:attr="data-graph=${graphJson},hx-swap-oob=${oob ? 'true' : null}"></div>
+
+<span th:fragment="context(oob)" id="context" th:attr="hx-swap-oob=${oob ? 'true' : null}">
+    <input type="hidden" name="node" th:value="${view.selectedId}">
+    <input type="hidden" name="tab" th:value="${view.tab}">
+</span>
+
+<div th:fragment="notice(oob)" id="notice" th:attr="hx-swap-oob=${oob ? 'true' : null}" role="status">
+    <div th:if="${notice != null}" class="notice" th:classappend="${notice.error ? 'bg-bad text-on-accent' : 'bg-ink text-canvas'}"
+         th:text="${notice.text}">Committed</div>
+</div>
+
+<div th:fragment="readResult(oob)" id="read-result" th:attr="hx-swap-oob=${oob ? 'true' : null}">
+    <div th:if="${readResult != null}" class="max-h-60 overflow-y-auto px-5 py-3 border-b border-line">
+        <div class="flex items-center justify-between gap-3">
+            <p class="text-muted" th:text="${readResult.summary}">Linearizable read</p>
+            <button class="btn-link" type="button" onclick="this.closest('div').parentElement.remove()">Hide</button>
+        </div>
+        <ol class="mt-2" th:unless="${readResult.entries.isEmpty()}">
+            <li class="flex gap-3 py-1" th:each="entry : ${readResult.entries}">
+                <span class="w-8 flex-none text-right text-muted font-mono tabular-nums" th:text="${entry.number}">1</span>
+                <span class="font-mono break-anywhere" th:text="${entry.text}">SET x=1</span>
+            </li>
+        </ol>
+    </div>
+</div>
+
+<!-- The live part of the page. It reloads itself, and morphing keeps scroll positions intact.
+     Its sections are direct items of .dashboard-grid, because this element only exists for htmx. -->
+<div th:fragment="state" id="state" class="contents"
+     th:attr="hx-get=@{/(node=${view.selectedId},tab=${view.tab})}"
+     hx-trigger="every 1500ms [document.visibilityState === 'visible']" hx-sync="this:drop">
+
+    <section class="area-metrics grid grid-cols-2 md:grid-cols-4 gap-4" aria-label="Metrics">
+        <div class="bg-surface rounded-2xl shadow-card px-5 py-4" th:each="stat : ${view.stats}">
+            <div class="text-xs text-muted" th:text="${stat.label}">Throughput</div>
+            <div class="mt-2 text-3xl font-semibold tracking-tight">
+                <span th:text="${stat.value}">0</span><span class="ml-1 text-sm font-normal tracking-normal text-muted" th:text="${stat.unit}"></span>
+            </div>
+        </div>
+    </section>
+
+    <section class="area-nodes bg-surface rounded-2xl shadow-card overflow-hidden">
+        <div class="flex items-center justify-between gap-3 px-5 py-4">
+            <h2 class="text-base font-semibold">Nodes</h2>
+            <form method="post" th:action="@{/actions/add-node(node=${view.selectedId},tab=${view.tab})}">
+                <button class="btn-link" type="submit" th:disabled="${!view.hasLeader}">Add Node</button>
+            </form>
+        </div>
+        <table class="w-full">
+            <thead>
+                <tr class="border-b border-line text-xs text-muted">
+                    <th scope="col" class="pl-5 pr-3 pb-2 text-left font-normal">Name</th>
+                    <th scope="col" class="pr-3 pb-2 text-left font-normal">Role</th>
+                    <th scope="col" class="pr-3 pb-2 text-right font-normal hidden sm:table-cell">Term</th>
+                    <th scope="col" class="pr-3 pb-2 text-right font-normal">Committed</th>
+                    <th scope="col" class="pr-5 pb-2 text-right font-normal hidden sm:table-cell">Log</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr class="row relative border-b border-line last:border-b-0" th:each="node : ${view.nodes}"
+                    th:classappend="${node.selected ? 'bg-accent-tint' : ''}">
+                    <td class="pl-5 pr-3 py-3 font-medium">
+                        <a class="stretched-link" th:href="@{/(node=${node.id},tab=${view.tab})}"
+                           th:attr="data-node-link=${node.id}" th:text="${node.id}">node1</a>
+                    </td>
+                    <td class="pr-3 py-3">
+                        <span class="inline-flex items-center gap-2 whitespace-nowrap">
+                            <span class="dot" th:classappend="${node.role.dot}"></span>
+                            <span th:text="${node.role.label}">Leader</span>
+                        </span>
+                    </td>
+                    <td class="pr-3 py-3 text-right tabular-nums hidden sm:table-cell" th:text="${node.term}">1</td>
+                    <td class="pr-3 py-3 text-right tabular-nums" th:text="${node.committed}">1</td>
+                    <td class="pr-5 py-3 text-right tabular-nums hidden sm:table-cell" th:text="${node.log}">1</td>
+                </tr>
+            </tbody>
+        </table>
+    </section>
+
+    <section class="area-inspector flex flex-col bg-surface rounded-2xl shadow-card overflow-hidden" aria-label="Selected node" th:with="i=${view.inspector}">
+        <div class="px-5 py-6 text-center text-muted" th:if="${i == null}">No node selected</div>
+        <th:block th:if="${i != null}">
+            <div class="px-5 pt-5">
+                <h2 class="text-2xl font-semibold tracking-tight" th:text="${i.id}">node1</h2>
+                <span class="mt-1 inline-flex items-center gap-2 text-muted">
+                    <span class="dot" th:classappend="${i.role.dot}"></span>
+                    <span th:text="${i.role.label}">Leader</span>
+                </span>
+            </div>
+
+            <div class="flex flex-wrap gap-2 px-5 py-4">
+                <form method="post" th:if="${i.suspended}" th:action="@{/actions/nodes/{id}/resume(id=${i.id},tab=${view.tab})}">
+                    <button class="btn" type="submit">Resume</button>
+                </form>
+                <form method="post" th:unless="${i.suspended}" th:action="@{/actions/nodes/{id}/suspend(id=${i.id},tab=${view.tab})}">
+                    <button class="btn" type="submit" th:disabled="${!i.online}">Suspend</button>
+                </form>
+                <form method="post" th:if="${i.managed}" th:action="@{/actions/nodes/{id}/stop(id=${i.id},tab=${view.tab})}"
+                      th:attr="hx-confirm='Stop ' + ${i.id} + '? It keeps its data and can be started again.'">
+                    <button class="btn" type="submit">Stop</button>
+                </form>
+                <form method="post" th:unless="${i.managed}" th:action="@{/actions/nodes/{id}/start(id=${i.id},tab=${view.tab})}">
+                    <button class="btn" type="submit" th:disabled="${i.online}">Start</button>
+                </form>
+                <form method="post" th:action="@{/actions/nodes/{id}/remove(id=${i.id},tab=${view.tab})}"
+                      th:attr="hx-confirm='Remove ' + ${i.id} + ' from the Raft cluster? Its process keeps running until you stop it.'">
+                    <button class="btn text-bad" type="submit" th:disabled="${!i.member}">Remove</button>
+                </form>
+            </div>
+
+            <p class="px-5 py-6 text-center text-muted border-t border-line" th:unless="${i.online}"
+               th:text="${i.managed ? 'This node is starting.' : 'This node is not running.'}">This node is not running.</p>
+
+            <th:block th:if="${i.online}">
+                <div class="divide-y mx-5 border-t border-line">
+                    <div class="flex justify-between gap-4 py-2" th:each="row : ${i.details}">
+                        <span class="flex-none text-muted" th:text="${row.label}">Leader</span>
+                        <span class="text-right tabular-nums" th:text="${row.value}">node1</span>
+                    </div>
+                </div>
+
+                <nav class="flex mx-5 mt-3 mb-3 p-px bg-fill rounded-lg" aria-label="Details">
+                    <a class="segment" th:href="@{/(node=${i.id},tab='activity')}"
+                       th:classappend="${view.tab == 'activity' ? 'segment-active' : ''}">Activity</a>
+                    <a class="segment" th:href="@{/(node=${i.id},tab='entries')}"
+                       th:classappend="${view.tab == 'entries' ? 'segment-active' : ''}"
+                       th:text="|State Machine (${i.entryCount})|">State Machine</a>
+                </nav>
+
+                <!-- Fills what is left of the panel instead of making the panel grow with its content -->
+                <div id="details-feed" class="feed border-t border-line">
+                    <th:block th:if="${view.tab == 'activity'}">
+                        <p class="px-5 py-6 text-center text-muted" th:if="${i.events.isEmpty()}">No activity yet</p>
+                        <div class="divide-y mx-5">
+                            <div class="py-2" th:each="event : ${i.events}">
+                                <div class="flex justify-between gap-3 font-medium">
+                                    <span th:text="${event.title}">Election won</span>
+                                    <time class="font-normal text-muted tabular-nums" th:text="${event.time}">12:00:00</time>
+                                </div>
+                                <div class="text-muted break-anywhere" th:text="${event.text}">Won election</div>
+                            </div>
+                        </div>
+                    </th:block>
+                    <th:block th:if="${view.tab == 'entries'}">
+                        <p class="px-5 py-6 text-center text-muted" th:if="${i.entries.isEmpty()}">No commands applied yet</p>
+                        <p class="px-5 py-2 text-xs text-muted" th:if="${i.entriesTruncated}">Showing the latest 200</p>
+                        <div class="divide-y mx-5">
+                            <div class="flex gap-3 py-2" th:each="entry : ${i.entries}">
+                                <span class="w-8 flex-none text-right text-muted font-mono tabular-nums" th:text="${entry.number}">1</span>
+                                <span class="font-mono break-anywhere" th:text="${entry.text}">SET x=1</span>
+                            </div>
+                        </div>
+                    </th:block>
+                </div>
+            </th:block>
+        </th:block>
+    </section>
+
+    <section class="area-logs bg-surface rounded-2xl shadow-card overflow-hidden" aria-label="Log state of every machine">
+        <div class="flex flex-wrap items-center justify-between gap-3 px-5 py-4">
+            <h2 class="text-base font-semibold">Logs</h2>
+            <p class="text-xs text-muted" th:unless="${view.logMatrix.isEmpty()}">Numbers are terms. Showing the latest 30 positions. Hover over an entry for details.</p>
+        </div>
+        <div class="px-5 pb-4" th:unless="${view.logMatrix.isEmpty()}">
+            <div class="overflow-x-auto">
+                <table class="log-table">
+                    <caption class="sr-only">Log entries per machine. Each cell shows the term of an entry.</caption>
+                    <thead>
+                        <tr>
+                            <th scope="col" class="pr-3 text-left text-xs font-normal text-muted">Entry</th>
+                            <th scope="col" class="log-index" th:each="column : ${view.logMatrix.columns}"
+                                th:text="${column.labeled ? column.number : ''}"></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr th:each="row : ${view.logMatrix.rows}">
+                            <th scope="row" class="pr-3 text-left font-medium whitespace-nowrap">
+                                <span class="inline-flex items-center gap-2">
+                                    <span class="dot" th:classappend="${row.role.dot}" th:title="${row.role.label}"></span>
+                                    <span th:text="${row.id}">node1</span>
+                                </span>
+                            </th>
+                            <td th:each="cell : ${row.cells}">
+                                <span class="log-cell" th:classappend="${cell.style + (cell.differs ? ' log-differs' : '')}"
+                                      th:title="${cell.tooltip}" th:text="${cell.text}">1</span>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <ul class="flex flex-wrap items-center gap-x-4 gap-y-1 mt-3 text-xs text-muted" aria-label="Legend">
+                <li class="inline-flex items-center gap-2"><span class="log-cell log-committed log-swatch"></span>Committed</li>
+                <li class="inline-flex items-center gap-2"><span class="log-cell log-uncommitted log-swatch"></span>Not committed</li>
+                <li class="inline-flex items-center gap-2"><span class="log-cell log-committed log-noop log-swatch"></span>No-op</li>
+                <li class="inline-flex items-center gap-2"><span class="log-cell log-committed log-config log-swatch"></span>Membership</li>
+                <li class="inline-flex items-center gap-2"><span class="log-cell log-compacted log-swatch"></span>In snapshot</li>
+                <li class="inline-flex items-center gap-2"><span class="log-cell log-committed log-differs log-swatch"></span>Differs from leader</li>
+            </ul>
+        </div>
+        <p class="px-5 pb-6 text-center text-muted" th:if="${view.logMatrix.isEmpty()}">No log entries yet</p>
+    </section>
+
+    <section class="area-replication bg-surface rounded-2xl shadow-card overflow-hidden">
+        <div class="px-5 py-4">
+            <h2 class="text-base font-semibold">Replication</h2>
+        </div>
+        <p class="px-5 pb-6 text-center text-muted" th:if="${view.replication.isEmpty()}">Available while the cluster has a leader</p>
+        <div class="divide-y mx-5 mb-2" th:unless="${view.replication.isEmpty()}">
+            <div class="flex justify-between gap-4 py-2" th:each="row : ${view.replication}">
+                <span class="font-medium" th:text="${row.peer}">node2</span>
+                <span class="inline-flex items-center gap-2 tabular-nums">
+                    <span class="dot" th:classappend="${row.dot}"></span>
+                    <span th:text="${row.label}">Up to date</span>
+                </span>
+            </div>
+        </div>
+    </section>
+
+    <section class="area-snapshots bg-surface rounded-2xl shadow-card overflow-hidden">
+        <div class="flex items-center justify-between gap-3 px-5 py-4">
+            <h2 class="text-base font-semibold">Snapshots</h2>
+            <form method="post" th:action="@{/actions/snapshot(node=${view.selectedId},tab=${view.tab})}">
+                <button class="btn-link" type="submit" th:disabled="${!view.hasLeader}">Create Snapshot</button>
+            </form>
+        </div>
+        <p class="px-5 pb-6 text-center text-muted" th:if="${view.snapshots.isEmpty()}">Available while the cluster has a leader</p>
+        <div class="divide-y mx-5 mb-2" th:unless="${view.snapshots.isEmpty()}">
+            <div class="flex justify-between gap-4 py-2" th:each="row : ${view.snapshots}">
+                <span class="text-muted" th:text="${row.label}">Latest</span>
+                <span class="text-right tabular-nums" th:text="${row.value}">None</span>
+            </div>
+        </div>
+    </section>
+</div>
+
+</body>
+</html>
