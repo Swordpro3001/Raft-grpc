@@ -2,7 +2,7 @@ plugins {
 	id 'java'
 	id 'org.springframework.boot' version '4.1.2'
 	id 'io.spring.dependency-management' version '1.1.7'
-	id 'com.google.protobuf' version '0.10.0'
+	id 'com.google.protobuf' version '0.10.1'
 }
 
 group = 'com.example'
@@ -32,7 +32,7 @@ dependencies {
 	implementation 'org.springframework.boot:spring-boot-starter-thymeleaf'
 	implementation 'org.webjars:webjars-locator-lite'
 	// Dashboard libraries, served locally from /webjars. htmx stays on 2.x until 4.x has settled.
-	runtimeOnly 'org.webjars.npm:htmx.org:4.0.0'
+	runtimeOnly 'org.webjars.npm:htmx.org:4.0.1'
 	runtimeOnly 'org.webjars.npm:idiomorph:0.7.4'
 	runtimeOnly 'org.webjars.npm:cytoscape:3.34.4'
 	implementation 'com.h2database:h2'
